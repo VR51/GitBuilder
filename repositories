@@ -1,0 +1,20 @@
+# A couple of my favourite repositories
+The script has been tested to work with these repositories.
+
+Try these example repositories with GitBuilder to get you started with using this GitHub repository management and build automation tool.
+
+After launching GitBuilder,
+
+  press 1 to add a GitHub repository then enter the details shown below here to add one or more GitHub repository,
+  Press 4 to download and build a repository,
+  Press 7 to launch the built program.
+
+## Atari800
+
+Name: Atari800
+URL: https://github.com/atari800/atari800.git
+
+## ZEsarUX
+
+Name: ZEsarUX
+URL: https://github.com/chernandezba/zesarux.git
