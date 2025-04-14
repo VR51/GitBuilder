@@ -5,12 +5,14 @@ GitBuilder is a powerful command-line tool for managing GitHub repositories, aut
 ## Features
 
 - **Repository Management**: Add, edit, and remove GitHub repositories
-- **Automated Building**: Detect and use the appropriate build system (CMake, Autotools, Make, etc.)
-- **Binary Management**: Find, register, and launch built binaries
+- **Automated Building**: Detect and use the appropriate build system (CMake, Autotools, Make, Gradle, Maven, etc.)
+- **Binary Management**: Find, register, and launch built binaries with an interactive file browser
 - **Build Configuration**: Customize build flags for different build systems
 - **Repository Updates**: Keep repositories up-to-date with the latest commits
-- **Build Details**: View comprehensive information about repositories and their build status
+- **Build Details**: View and edit comprehensive information about repositories and their build status
 - **Smart Caching**: Efficient handling of GitHub API requests with 4-hour caching
+- **Existing Clone Support**: Option to use existing repository clones instead of downloading fresh copies
+- **Interactive File Browser**: Browse directories and select executable files with an intuitive interface
 
 ## Installation
 
@@ -55,9 +57,9 @@ Simply run the script:
 1. **Add repository**: Add a new GitHub repository to manage
 2. **Edit repository**: Modify an existing repository's details
 3. **Remove repository**: Delete a repository from the database
-4. **Download and build**: Clone and build a repository
-5. **See build details**: View comprehensive information about a repository
-6. **Configure build options**: Set custom build flags
+4. **Download and build**: Clone and build a repository (with option to use existing clones)
+5. **See/edit build details**: View and edit comprehensive information about a repository
+6. **Configure build options**: Set custom build flags for different build systems
 7. **Launch binary**: Run a built binary
 8. **Update all repositories**: Update all repositories to their latest versions
 9. **Exit**: Quit the application
@@ -69,14 +71,19 @@ GitBuilder automatically detects and uses the appropriate build system:
 - **CMake**: For projects using CMakeLists.txt
 - **Autotools**: For projects using configure scripts or autogen.sh
 - **Make**: For projects using Makefiles
-- **Others**: Support for Python, Node.js, Meson, Gradle, and Maven projects
+- **Gradle**: For Java/Android projects using build.gradle
+- **Maven**: For Java projects using pom.xml
+- **Python**: For Python projects with setup.py
+- **Node.js**: For JavaScript projects with package.json
+- **Meson**: For projects using meson.build
 
 ## Binary Management
 
 After building a project, GitBuilder can:
 - Automatically detect built binaries
-- Register them for easy access
-- Launch them in either quiet (background) or verbose (terminal output) mode
+- Register them for easy access using an interactive file browser
+- Browse directories and select executable files with a user-friendly interface
+- Launch binaries in either quiet (background) or verbose (terminal output) mode
 
 ## Configuration
 
@@ -95,15 +102,22 @@ GitBuilder stores all data in `~/.local/share/gitbuilder/`:
 4. Select "Download and build" from the main menu
 5. Enter the repository ID to build
 
-### Viewing Build Details
+### Notes on Binary Management
 
-1. Select "See build details" from the main menu
+GitBuilder does not yet detect software libraries required by individual projects. You may need to install them manually.
+
+Binaries are installed locally in the `~/.local/share/gitbuilder/src/` directory. This means you do not usually need to use sudo to launch them.
+
+### Viewing and Editing Build Details
+
+1. Select "See/edit build details" from the main menu
 2. Enter the repository ID
-3. View comprehensive information about the repository, including:
+3. View and edit comprehensive information about the repository, including:
    - Repository details (name, URL, commit dates)
    - Build status and type
-   - Binary information
-   - Build configuration flags
+   - Binary information and path (with interactive file browser)
+   - Build configuration flags for different build systems (Configure, Make, CMake)
+4. Use the interactive menu to edit repository details and build configurations
 
 ### Launching a Binary
 
@@ -128,7 +142,7 @@ If you find this tool useful, please consider donating:
 ## Authors
 
 - **Cascade** - *Initial work*
-- **VR51** - *Prompt Engineer*
+- **VR51** - *Prompt Engineer* *Maintainer* *Developer* *Project Supervisor*
 
 ---
 
