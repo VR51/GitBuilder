@@ -3,7 +3,7 @@
 # GitBuilder - GitHub repository management and build automation tool
 # Author: Cascade
 # Prompt Engineer: VR51
-# Version: 1.0.0
+# Version: 1.0.1
 # Created: 2025-04-11
 # Updated: 2025-04-14
 # License: GNU General Public License v3.0
@@ -315,10 +315,29 @@ find_build_files() {
     # Log the build detection process
     echo "Searching for build files in $dir (depth $depth)" > "$log_file"
     
+    # Special case for MAME - check if this is the MAME repository
+    if [ -f "$dir/makefile" ] && grep -q "MAMEMESS" "$dir/makefile" 2>/dev/null; then
+        echo "Found MAME makefile in root directory" >> "$log_file"
+        build_files=("$dir/makefile")
+        echo "${build_files[@]}"
+        return 0
+    fi
+    
     # First, look specifically for autogen.sh in the root directory
     if [ -x "$dir/autogen.sh" ] && { [ -f "$dir/configure.ac" ] || [ -f "$dir/configure.in" ]; }; then
         echo "Found autogen.sh in root directory" >> "$log_file"
         build_files=("$dir/autogen.sh")
+        echo "${build_files[@]}"
+        return 0
+    fi
+    
+    # Check for Makefile in root directory (common for many projects)
+    if [ -f "$dir/Makefile" ] || [ -f "$dir/makefile" ]; then
+        echo "Found Makefile in root directory" >> "$log_file"
+        build_files=("$dir/Makefile")
+        if [ ! -f "$dir/Makefile" ] && [ -f "$dir/makefile" ]; then
+            build_files=("$dir/makefile")
+        fi
         echo "${build_files[@]}"
         return 0
     fi
@@ -424,7 +443,13 @@ get_build_type() {
                 echo "autogen|$dirname|Autotools build system (needs autogen)"
             fi
             ;;
-        "Makefile")
+        "Makefile" | "makefile")
+            # Special case for MAME
+            if grep -q "MAMEMESS" "$file" 2>/dev/null; then
+                echo "make|$dirname|MAME build system"
+                return 0
+            fi
+            
             # Don't use Makefile if there's a higher priority build system
             if [ -f "$dirname/CMakeLists.txt" ] || 
                [ -f "$dirname/configure" ] || 
@@ -477,13 +502,52 @@ update_all_repos() {
 # Get build configuration for a repository
 get_build_config() {
     local repo_id="$1"
+    
+    # Get build configuration from database
     local config
     config=$(sqlite3 "$DB_FILE" "SELECT configure_flags, make_flags, cmake_flags FROM build_configs WHERE repo_id = $repo_id;")
+    
+    # If no config exists, create an empty one
     if [ -z "$config" ]; then
         sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags) VALUES ($repo_id, '', '', '');"
-        echo "||"  # Default empty flags
+        echo "|||"
     else
         echo "$config"
+    fi
+}
+
+# Update build configuration for a repository
+update_build_config() {
+    local repo_id="$1"
+    local field="$2"
+    local value="$3"
+    
+    # Escape single quotes in the value
+    value=$(echo "$value" | sed "s/'/''/g")
+    
+    # Check if the build config exists
+    local exists
+    exists=$(sqlite3 "$DB_FILE" "SELECT 1 FROM build_configs WHERE repo_id = $repo_id;")
+    
+    if [ -z "$exists" ]; then
+        # Create a new build config entry
+        case "$field" in
+            configure_flags)
+                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags) 
+                    VALUES ($repo_id, '$value', '', '');"
+                ;;
+            make_flags)
+                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags) 
+                    VALUES ($repo_id, '', '$value', '');"
+                ;;
+            cmake_flags)
+                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags) 
+                    VALUES ($repo_id, '', '', '$value');"
+                ;;
+        esac
+    else
+        # Update the existing build config
+        sqlite3 "$DB_FILE" "UPDATE build_configs SET $field = '$value' WHERE repo_id = $repo_id;"
     fi
 }
 
@@ -594,59 +658,35 @@ find_binary() {
         "$dir/target/release"
         "$dir/target/debug"
         "$dir/dist"
-        "build"
-        "build/src"
-        "build/Debug"
-        "build/Release"
-        "target/release"
-        "target/debug"
-        "dist"
-        "dist/bin"
-        "out"
-        "out/bin"
-        "output"
-        "output/bin"
-        "src"
-        "src/bin"
     )
     
-    # First try to find binaries with matching names
-    local name_pattern="*${name}*"
-    while IFS= read -r -d '' file; do
-        if [ -x "$file" ] && [ -f "$file" ]; then
-            local mime_type
-            mime_type=$(file -b --mime-type "$file")
-            if [[ "$mime_type" == "application/x-executable" || "$mime_type" == "application/x-pie-executable" ]]; then
-                # Prioritize exact name matches
-                local base_name=$(basename "$file" | tr '[:upper:]' '[:lower:]')
-                local repo_name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
-                if [[ "$base_name" == "$repo_name" ]]; then
-                    binaries=("$file" "${binaries[@]}")
-                elif [[ "$base_name" == *"$repo_name"* ]] || [[ "$repo_name" == *"$base_name"* ]]; then
-                    binaries+=("$file")
-                fi
-            fi
-        fi
-    done < <(find "$dir" -maxdepth 3 -type f -name "$name_pattern" -print0)
-    
-    # If no name matches found, try common directories
-    if [ ${#binaries[@]} -eq 0 ]; then
-        for build_dir in "${build_dirs[@]}"; do
-            if [ -d "$dir/$build_dir" ]; then
-                while IFS= read -r -d '' file; do
-                    if [ -x "$file" ] && [ -f "$file" ]; then
-                        local mime_type
-                        mime_type=$(file -b --mime-type "$file")
-                        if [[ "$mime_type" == "application/x-executable" || "$mime_type" == "application/x-pie-executable" ]]; then
-                            binaries+=("$file")
-                        fi
-                    fi
-                done < <(find "$dir/$build_dir" -maxdepth 2 -type f -print0)
-            fi
-        done
+    # Special case for MAME - check if the mame binary exists in the root directory
+    if [ -x "$dir/mame" ] && [ -f "$dir/mame" ]; then
+        binaries+=("$dir/mame")
     fi
     
-    # If still no binaries found, do a deep search
+    # Check each build directory for binaries
+    for build_dir in "${build_dirs[@]}"; do
+        if [ -d "$build_dir" ]; then
+            # Look for binaries with the same name as the repository
+            if [ -x "$build_dir/$name" ] && [ -f "$build_dir/$name" ]; then
+                binaries+=("$build_dir/$name")
+            fi
+            
+            # Look for binaries in the build directory
+            while IFS= read -r -d '' file; do
+                if [ -x "$file" ] && [ -f "$file" ]; then
+                    local mime_type
+                    mime_type=$(file -b --mime-type "$file")
+                    if [[ "$mime_type" == "application/x-executable" || "$mime_type" == "application/x-pie-executable" ]]; then
+                        binaries+=("$file")
+                    fi
+                fi
+            done < <(find "$build_dir" -maxdepth 1 -type f -print0 2>/dev/null)
+        fi
+    done
+    
+    # If no binaries found in common directories, search the entire directory
     if [ ${#binaries[@]} -eq 0 ]; then
         while IFS= read -r -d '' file; do
             if [ -x "$file" ] && [ -f "$file" ]; then
@@ -656,87 +696,106 @@ find_binary() {
                     binaries+=("$file")
                 fi
             fi
-        done < <(find "$dir" -type f -print0)
+        done < <(find "$dir" -type f -executable -print0 2>/dev/null)
     fi
     
-    echo "${binaries[@]}"
+    # Return binaries one per line instead of space-separated
+    for binary in "${binaries[@]}"; do
+        echo "$binary"
+    done
 }
 
 # Handle build result
 browse_for_binary() {
-    local dir="$1"
+    # Direct file browser implementation with temporary file output
+    local start_dir="$1"
     
-    # Ensure we're working with an absolute path
-    dir=$(realpath "$dir")
+    # Ensure the directory exists
+    if [ ! -d "$start_dir" ]; then
+        mkdir -p "$start_dir"
+        echo "Created directory: $start_dir"
+    fi
+    
+    # Remove any existing temporary file
+    rm -f "/tmp/gitbuilder_selected_binary"
+    
+    local current_dir=$(realpath "$start_dir")
     
     while true; do
+        # Clear screen and show header
         clear
-        local i=1
-        declare -a files
+        echo "=========================================="
+        echo "FILE BROWSER - Select a binary"
+        echo "Current directory: $current_dir"
+        echo "=========================================="
         
-        echo -e "${BLUE}File Browser - Navigate to find your binary${NC}"
-        echo -e "Current directory: ${YELLOW}$dir${NC}"
-        echo -e "\n${GREEN}Navigation:${NC}"
-        echo "0) ..(parent directory)"
+        # Show parent directory option
+        echo "0) .. (Go to parent directory)"
         
-        # List directories first
-        local count=0
-        while IFS= read -r item; do
-            ((count++))
-            echo "$i) [DIR] $item/"
-            files[$i]="$dir/$item"
-            ((i++))
-        done < <(cd "$dir" && find . -maxdepth 1 -mindepth 1 -type d -printf "%f\n" | sort)
+        # Initialize arrays for menu items
+        declare -a items_path
+        declare -a items_type
+        local count=1
         
-        # Then list executables
-        while IFS= read -r item; do
-            local full_path="$dir/$item"
-            if [ -x "$full_path" ]; then
-                local mime_type
-                mime_type=$(file -b --mime-type "$full_path")
-                if [[ "$mime_type" == "application/x-executable" || "$mime_type" == "application/x-pie-executable" ]]; then
-                    echo "$i) [BIN] $item"
-                    files[$i]="$full_path"
-                    ((i++))
-                fi
+        # First list directories
+        echo 
+        echo "DIRECTORIES:"
+        for d in "$current_dir"/*/; do
+            if [ -d "$d" ]; then
+                local name=$(basename "$d")
+                echo "$count) [DIR] $name/"
+                items_path[$count]="$d"
+                items_type[$count]="dir"
+                count=$((count+1))
             fi
-        done < <(cd "$dir" && find . -maxdepth 1 -mindepth 1 -type f -printf "%f\n" | sort)
+        done
         
-        # Show options
-        echo -e "\n${GREEN}Options:${NC}"
+        # Then list executable files
+        echo 
+        echo "EXECUTABLE FILES:"
+        for f in "$current_dir"/*; do
+            if [ -f "$f" ] && [ -x "$f" ]; then
+                local name=$(basename "$f")
+                echo "$count) [BIN] $name"
+                items_path[$count]="$f"
+                items_type[$count]="bin"
+                count=$((count+1))
+            fi
+        done
+        
+        # Show navigation options
+        echo 
         echo "q) Quit browser"
+        echo 
         
-        # If no files were found
-        if [ $i -eq 1 ] && [ "$dir" != "/" ]; then
-            echo -e "\n${YELLOW}No files found in this directory${NC}"
-        fi
+        # Get user selection
+        echo -n "Select option (0-$((count-1)), q to quit): "
+        read choice
         
-        local choice
-        read -rp "\nSelect an option (0-$((i-1)), or 'q' to quit): " choice
-        
-        if [[ "$choice" == "q" ]]; then
+        # Process the selection
+        if [ "$choice" = "q" ]; then
+            # User wants to quit
             return 1
-        elif [[ "$choice" == "0" ]]; then
-            if [[ "$dir" != "/" ]]; then
-                dir=$(dirname "$dir")
-                continue
+        elif [ "$choice" = "0" ]; then
+            # Go to parent directory
+            if [ "$current_dir" != "/" ]; then
+                current_dir=$(dirname "$current_dir")
             fi
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 0 ]] && [[ "$choice" -lt "$i" ]]; then
-            local selected="${files[$choice]}"
-            if [[ -n "$selected" ]]; then
-                if [[ -d "$selected" ]]; then
-                    dir="$selected"
-                    continue
-                else
-                    echo "$selected"
-                    return 0
-                fi
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$count" ]; then
+            # Valid selection
+            if [ "${items_type[$choice]}" = "dir" ]; then
+                # Navigate to selected directory
+                current_dir="${items_path[$choice]}"
+            elif [ "${items_type[$choice]}" = "bin" ]; then
+                # Save selected binary path to temporary file
+                echo "${items_path[$choice]}" > "/tmp/gitbuilder_selected_binary"
+                return 0
             fi
+        else
+            # Invalid selection
+            echo "Invalid selection. Press any key to continue..."
+            read -n 1
         fi
-        
-        # Invalid choice, show error and continue
-        echo -e "\n${RED}Invalid selection${NC}"
-        read -n 1 -s -r -p "Press any key to continue..."
     done
 }
 
@@ -753,8 +812,10 @@ handle_build_result() {
         echo -e "\n${GREEN}Build completed successfully!${NC}"
         
         # Look for potential binary files
-        local binaries
-        binaries=($(find_binary "$build_dir" "$name"))
+        echo -e "\n${BLUE}Looking for binary files...${NC}"
+        local binaries=()
+        # Capture each line of output as a separate array element
+        mapfile -t binaries < <(find_binary "$build_dir" "$name")
         
         if [ ${#binaries[@]} -gt 0 ]; then
             echo -e "\n${BLUE}Found potential binary files:${NC}"
@@ -771,8 +832,17 @@ handle_build_result() {
             if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#binaries[@]}" ]; then
                 selected_binary="${binaries[$choice-1]}"
             elif [[ $choice == "b" ]]; then
+                # Call the browse_for_binary function and capture its output and return code
                 selected_binary=$(browse_for_binary "$build_dir")
-                if [ $? -ne 0 ]; then
+                local browse_status=$?
+                if [ $browse_status -ne 0 ]; then
+                    echo -e "${YELLOW}Binary selection cancelled${NC}"
+                    return 1
+                fi
+                
+                # Verify the selected binary exists and is executable
+                if [ ! -x "$selected_binary" ]; then
+                    echo -e "${RED}Error: Selected binary is not executable${NC}"
                     return 1
                 fi
             else
@@ -795,8 +865,10 @@ handle_build_result() {
             read -rp "Would you like to browse for the binary? (Y/n): " browse_choice
             if [[ ! $browse_choice =~ ^[Nn]$ ]]; then
                 local selected_binary
+                # Call the browse_for_binary function and capture its output and return code
                 selected_binary=$(browse_for_binary "$build_dir")
-                if [ $? -eq 0 ]; then
+                local browse_status=$?
+                if [ $browse_status -eq 0 ] && [ -x "$selected_binary" ]; then
                     echo -e "${GREEN}Selected binary: $selected_binary${NC}"
                     
                     # Save binary path to database
@@ -922,7 +994,66 @@ execute_build() {
                     
                 "make")
                     cd "$dir" || exit 1
-                    make $make_flags > "$log_file" 2>&1
+                    
+                    # Special handling for MAME
+                    if [ -f "makefile" ] && grep -q "MAMEMESS" "makefile" 2>/dev/null; then
+                        echo "Building MAME..." >> "$log_file"
+                        # MAME typically needs specific targets
+                        make $make_flags > "$log_file" 2>&1
+                    else
+                        # Regular make build
+                        make $make_flags > "$log_file" 2>&1
+                    fi
+                    ;;
+                    
+                "gradle")
+                    cd "$dir" || exit 1
+                    {
+                        echo "Running gradle build..." >> "$log_file"
+                        # Check if gradlew exists and is executable
+                        if [ -x "./gradlew" ]; then
+                            echo "Using Gradle wrapper..." >> "$log_file"
+                            ./gradlew build
+                        elif command -v gradle >/dev/null 2>&1; then
+                            echo "Using system Gradle..." >> "$log_file"
+                            gradle build
+                        else
+                            echo "Error: Neither Gradle wrapper nor system Gradle found" >> "$log_file"
+                            exit 1
+                        fi
+                    } > "$log_file" 2>&1
+                    ;;
+                    
+                "maven")
+                    cd "$dir" || exit 1
+                    {
+                        echo "Running maven build..." >> "$log_file"
+                        mvn clean install
+                    } > "$log_file" 2>&1
+                    ;;
+                    
+                "python")
+                    cd "$dir" || exit 1
+                    {
+                        echo "Building Python package..." >> "$log_file"
+                        python setup.py build
+                    } > "$log_file" 2>&1
+                    ;;
+                    
+                "node")
+                    cd "$dir" || exit 1
+                    {
+                        echo "Building Node.js package..." >> "$log_file"
+                        npm install && npm run build
+                    } > "$log_file" 2>&1
+                    ;;
+                    
+                "meson")
+                    cd "$dir" || exit 1
+                    {
+                        echo "Running meson build..." >> "$log_file"
+                        meson build && cd build && ninja
+                    } > "$log_file" 2>&1
                     ;;
                     
                 *)
@@ -1210,15 +1341,42 @@ download_build() {
     local repo_dir="$SRC_DIR/$name"
     
     if [ -d "$repo_dir" ]; then
-        echo "Updating repository..."
-        cd "$repo_dir" || {
-            error "Failed to access repository directory: $repo_dir"
-            return 1
-        }
-        if ! git pull; then
-            error "Failed to update repository"
-            return 1
-        fi
+        echo -e "\n${BLUE}Repository already exists locally.${NC}"
+        echo "1) Use existing repository and update it"
+        echo "2) Delete existing repository and clone fresh"
+        echo "3) Cancel"
+        
+        read -rp "Select an option: " choice
+        case $choice in
+            1)
+                echo "Updating repository..."
+                cd "$repo_dir" || {
+                    error "Failed to access repository directory: $repo_dir"
+                    return 1
+                }
+                if ! git pull; then
+                    error "Failed to update repository"
+                    return 1
+                fi
+                ;;
+            2)
+                echo "Deleting existing repository..."
+                rm -rf "$repo_dir"
+                echo "Cloning repository..."
+                if ! git clone "$url" "$name"; then
+                    error "Failed to clone repository"
+                    return 1
+                fi
+                ;;
+            3)
+                echo "Operation cancelled"
+                return 0
+                ;;
+            *)
+                error "Invalid option"
+                return 1
+                ;;
+        esac
     else
         echo "Cloning repository..."
         if ! git clone "$url" "$name"; then
@@ -1258,80 +1416,218 @@ record_build_type() {
 show_build_details() {
     local repo_id="$1"
     
-    # Get repository details
-    local repo_info
-    repo_info=$(sqlite3 "$DB_FILE" "SELECT name, url, last_commit, last_commit_check, last_built, 
-        build_success, binary_path, build_type, created_at FROM repositories WHERE id = $repo_id;")
-    
-    if [ -z "$repo_info" ]; then
-        error "Repository ID $repo_id not found"
+    # Validate repo_id is a number
+    if ! [[ "$repo_id" =~ ^[0-9]+$ ]]; then
+        error "Invalid repository ID: $repo_id"
         return 1
     fi
     
-    # Parse repository info
-    local name url last_commit last_commit_check last_built build_success binary_path build_type created_at
-    IFS='|' read -r name url last_commit last_commit_check last_built build_success binary_path build_type created_at <<< "$repo_info"
-    
-    # Get build configuration
-    local configure_flags make_flags cmake_flags
-    IFS='|' read -r configure_flags make_flags cmake_flags <<< "$(get_build_config "$repo_id")"
-    
-    # Format build success status
-    local build_status="Unknown"
-    if [ "$build_success" = "0" ]; then
-        build_status="${GREEN}Success${NC}"
-    elif [ "$build_success" = "1" ]; then
-        build_status="${RED}Failed${NC}"
-    fi
-    
-    # Format binary status
-    local binary_status="${RED}Not found${NC}"
-    if [ -n "$binary_path" ] && [ -x "$binary_path" ]; then
-        binary_status="${GREEN}Available${NC}"
-    fi
-    
-    # Format dates nicely
-    local formatted_commit_date=""
-    if [ -n "$last_commit" ]; then
-        formatted_commit_date=$(date -d "$last_commit" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_commit")
-    fi
-    
-    local formatted_commit_check=""
-    if [ -n "$last_commit_check" ]; then
-        formatted_commit_check=$(date -d "$last_commit_check" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_commit_check")
-    fi
-    
-    local formatted_built_date=""
-    if [ -n "$last_built" ]; then
-        formatted_built_date=$(date -d "$last_built" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_built")
-    fi
-    
-    local formatted_created_date=""
-    if [ -n "$created_at" ]; then
-        formatted_created_date=$(date -d "$created_at" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$created_at")
-    fi
-    
-    # Display repository details
-    echo -e "\n${BLUE}Repository Details${NC}"
-    echo -e "${YELLOW}ID:${NC}                $repo_id"
-    echo -e "${YELLOW}Name:${NC}              $name"
-    echo -e "${YELLOW}URL:${NC}               $url"
-    echo -e "${YELLOW}Added on:${NC}          $formatted_created_date"
-    echo -e "${YELLOW}Last commit:${NC}       $formatted_commit_date"
-    echo -e "${YELLOW}Commit checked:${NC}    $formatted_commit_check"
-    echo -e "${YELLOW}Last built:${NC}        $formatted_built_date"
-    echo -e "${YELLOW}Build status:${NC}      $build_status"
-    echo -e "${YELLOW}Build type:${NC}        $build_type"
-    echo -e "${YELLOW}Binary status:${NC}     $binary_status"
-    echo -e "${YELLOW}Binary path:${NC}       $binary_path"
-    
-    echo -e "\n${BLUE}Build Configuration${NC}"
-    echo -e "${YELLOW}Configure flags:${NC}   $configure_flags"
-    echo -e "${YELLOW}Make flags:${NC}        $make_flags"
-    echo -e "${YELLOW}CMake flags:${NC}       $cmake_flags"
-    
-    echo -e "\nPress any key to continue..."
-    read -r -n 1
+    while true; do
+        # Clear the screen
+        printf "\033c"
+        
+        # Get repository details
+        local repo_info
+        repo_info=$(sqlite3 "$DB_FILE" "SELECT name, url, last_commit, last_commit_check, last_built, 
+            build_success, binary_path, build_type, created_at FROM repositories WHERE id = $repo_id;")
+        
+        if [ -z "$repo_info" ]; then
+            error "Repository ID $repo_id not found"
+            return 1
+        fi
+        
+        # Parse repository info
+        local name url last_commit last_commit_check last_built build_success binary_path build_type created_at
+        IFS='|' read -r name url last_commit last_commit_check last_built build_success binary_path build_type created_at <<< "$repo_info"
+        
+        # Get build configuration
+        local configure_flags make_flags cmake_flags
+        IFS='|' read -r configure_flags make_flags cmake_flags <<< "$(get_build_config "$repo_id")"
+        
+        # Format build success status
+        local build_status="Unknown"
+        if [ "$build_success" = "0" ]; then
+            build_status="${GREEN}Success${NC}"
+        elif [ "$build_success" = "1" ]; then
+            build_status="${RED}Failed${NC}"
+        fi
+        
+        # Format binary status
+        local binary_status="${RED}Not found${NC}"
+        if [ -n "$binary_path" ] && [ -x "$binary_path" ]; then
+            binary_status="${GREEN}Available${NC}"
+        fi
+        
+        # Format dates nicely
+        local formatted_commit_date=""
+        if [ -n "$last_commit" ]; then
+            formatted_commit_date=$(date -d "$last_commit" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_commit")
+        fi
+        
+        local formatted_commit_check=""
+        if [ -n "$last_commit_check" ]; then
+            formatted_commit_check=$(date -d "$last_commit_check" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_commit_check")
+        fi
+        
+        local formatted_built_date=""
+        if [ -n "$last_built" ]; then
+            formatted_built_date=$(date -d "$last_built" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_built")
+        fi
+        
+        local formatted_created_date=""
+        if [ -n "$created_at" ]; then
+            formatted_created_date=$(date -d "$created_at" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$created_at")
+        fi
+        
+        # Display repository details as a menu
+        echo -e "\n${BLUE}Repository Details - Select an option to edit${NC}"
+        echo -e "1) ${YELLOW}Name:${NC}              $name"
+        echo -e "2) ${YELLOW}URL:${NC}               $url"
+        echo -e "3) ${YELLOW}Added on:${NC}          $formatted_created_date (not editable)"
+        echo -e "4) ${YELLOW}Last commit:${NC}       $formatted_commit_date (not editable)"
+        echo -e "5) ${YELLOW}Commit checked:${NC}    $formatted_commit_check (not editable)"
+        echo -e "6) ${YELLOW}Last built:${NC}        $formatted_built_date (not editable)"
+        echo -e "7) ${YELLOW}Build status:${NC}      $build_status (not editable)"
+        echo -e "8) ${YELLOW}Build type:${NC}        $build_type (not editable)"
+        echo -e "9) ${YELLOW}Binary status:${NC}     $binary_status (not editable)"
+        echo -e "10) ${YELLOW}Binary path:${NC}       $binary_path"
+        
+        echo -e "\n${BLUE}Build Configuration${NC}"
+        echo -e "11) ${YELLOW}Configure flags:${NC}   $configure_flags"
+        echo -e "12) ${YELLOW}Make flags:${NC}        $make_flags"
+        echo -e "13) ${YELLOW}CMake flags:${NC}       $cmake_flags"
+        
+        echo -e "\n${BLUE}Actions${NC}"
+        echo -e "14) Rebuild repository"
+        echo -e "15) Launch binary"
+        echo -e "0) Return to main menu"
+        
+        # Get user choice
+        echo
+        read -rp "Select an option (0-15): " choice
+        
+        case "$choice" in
+            0) return 0 ;;
+            1) # Edit name
+                read -rp "Enter new repository name: " new_name
+                if [ -n "$new_name" ]; then
+                    sqlite3 "$DB_FILE" "UPDATE repositories SET name = '$new_name' WHERE id = $repo_id;"
+                    echo -e "${GREEN}Repository name updated${NC}"
+                    sleep 1
+                fi
+                ;;
+            2) # Edit URL
+                read -rp "Enter new repository URL: " new_url
+                if [ -n "$new_url" ]; then
+                    sqlite3 "$DB_FILE" "UPDATE repositories SET url = '$new_url' WHERE id = $repo_id;"
+                    echo -e "${GREEN}Repository URL updated${NC}"
+                    sleep 1
+                fi
+                ;;
+            10) # Edit binary path
+                echo -e "${BLUE}Current binary path: $binary_path${NC}"
+                echo "1) Browse for binary"
+                echo "2) Enter path manually"
+                read -rp "Select an option: " binary_choice
+                
+                case "$binary_choice" in
+                    1) # Browse for binary
+                        local src_dir="$SRC_DIR/$name"
+                        
+                        # Debug: Check if directory exists
+                        if [ ! -d "$src_dir" ]; then
+                            echo -e "${RED}Error: Source directory $src_dir does not exist${NC}"
+                            echo -e "${YELLOW}Creating directory...${NC}"
+                            mkdir -p "$src_dir"
+                            sleep 2
+                        fi
+                        
+                        # Run the file browser directly
+                        echo -e "${BLUE}Starting file browser...${NC}"
+                        
+                        # Call browse_for_binary directly (not capturing output)
+                        browse_for_binary "$src_dir"
+                        
+                        # If we get here, the user either selected a binary or quit
+                        # Check if a binary path was saved to a temporary file
+                        if [ -f "/tmp/gitbuilder_selected_binary" ]; then
+                            local selected_binary=$(cat "/tmp/gitbuilder_selected_binary")
+                            rm -f "/tmp/gitbuilder_selected_binary"
+                            
+                            if [ -n "$selected_binary" ] && [ -x "$selected_binary" ]; then
+                                # Update the database with the selected binary path
+                                sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$selected_binary' WHERE id = $repo_id;"
+                                echo -e "${GREEN}Binary path updated: $selected_binary${NC}"
+                                sleep 2
+                            else
+                                echo -e "${RED}Error: Selected file is not executable${NC}"
+                                sleep 2
+                            fi
+                        else
+                            echo -e "${YELLOW}No binary selected${NC}"
+                            sleep 1
+                        fi
+                        ;;
+                    2) # Enter path manually
+                        read -rp "Enter new binary path: " new_path
+                        if [ -n "$new_path" ] && [ -x "$new_path" ]; then
+                            sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$new_path' WHERE id = $repo_id;"
+                            echo -e "${GREEN}Binary path updated${NC}"
+                            sleep 1
+                        elif [ -n "$new_path" ]; then
+                            echo -e "${RED}Error: File does not exist or is not executable${NC}"
+                            sleep 2
+                        fi
+                        ;;
+                    *) 
+                        echo -e "${RED}Invalid option${NC}"
+                        sleep 1
+                        ;;
+                esac
+                ;;
+            11) # Edit configure flags
+                read -rp "Enter new configure flags: " new_flags
+                if [ -n "$new_flags" ] || [ -z "$new_flags" ]; then
+                    update_build_config "$repo_id" "configure_flags" "$new_flags"
+                    echo -e "${GREEN}Configure flags updated${NC}"
+                    sleep 1
+                fi
+                ;;
+            12) # Edit make flags
+                read -rp "Enter new make flags: " new_flags
+                if [ -n "$new_flags" ] || [ -z "$new_flags" ]; then
+                    update_build_config "$repo_id" "make_flags" "$new_flags"
+                    echo -e "${GREEN}Make flags updated${NC}"
+                    sleep 1
+                fi
+                ;;
+            13) # Edit CMake flags
+                read -rp "Enter new CMake flags: " new_flags
+                if [ -n "$new_flags" ] || [ -z "$new_flags" ]; then
+                    update_build_config "$repo_id" "cmake_flags" "$new_flags"
+                    echo -e "${GREEN}CMake flags updated${NC}"
+                    sleep 1
+                fi
+                ;;
+            14) # Rebuild repository
+                printf "\033c"
+                echo -e "${BLUE}Rebuilding repository $name...${NC}"
+                download_build "$repo_id" "rebuild"
+                echo -e "\n${GREEN}Rebuild complete${NC}"
+                sleep 2
+                ;;
+            15) # Launch binary
+                printf "\033c"
+                launch_binary "$repo_id"
+                echo -e "\n${GREEN}Press any key to continue...${NC}"
+                read -r -n 1
+                ;;
+            *) 
+                echo -e "${RED}Invalid option${NC}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 show_repos() {
@@ -1391,9 +1687,11 @@ launch_binary() {
     if [ -z "$binary_path" ] || [ ! -x "$binary_path" ]; then
         echo -e "${YELLOW}No binary registered or binary not found. Searching for binaries...${NC}"
         
-        # Try to find binaries automatically
-        local binaries
-        binaries=($(find_binary "$src_dir" "$name"))
+        # Look for binaries
+        echo -e "\n${BLUE}Looking for binary files...${NC}"
+        local binaries=()
+        # Capture each line of output as a separate array element
+        mapfile -t binaries < <(find_binary "$src_dir" "$name")
         
         if [ ${#binaries[@]} -gt 0 ]; then
             echo -e "\n${BLUE}Found potential binary files:${NC}"
@@ -1410,8 +1708,21 @@ launch_binary() {
             if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#binaries[@]}" ]; then
                 binary_path="${binaries[$((choice-1))]}"
             elif [[ $choice == "b" ]]; then
+                # Clear the screen before calling the browser to avoid display issues
+                printf "\033c"
+                # Call the browse_for_binary function and capture its output and return code
                 binary_path=$(browse_for_binary "$src_dir")
-                if [ $? -ne 0 ]; then
+                local browse_status=$?
+                # Clear the screen again after returning from the browser
+                printf "\033c"
+                if [ $browse_status -ne 0 ]; then
+                    echo -e "${YELLOW}Binary selection cancelled${NC}"
+                    return 1
+                fi
+                
+                # Verify the selected binary exists and is executable
+                if [ ! -x "$binary_path" ]; then
+                    echo -e "${RED}Error: Selected binary is not executable${NC}"
                     return 1
                 fi
             else
@@ -1426,14 +1737,27 @@ launch_binary() {
             local browse_choice
             read -rp "Would you like to browse for the binary? (Y/n): " browse_choice
             if [[ ! $browse_choice =~ ^[Nn]$ ]]; then
+                # Clear the screen before calling the browser to avoid display issues
+                printf "\033c"
+                # Call the browse_for_binary function and capture its output and return code
                 binary_path=$(browse_for_binary "$src_dir")
-                if [ $? -eq 0 ]; then
-                    # Save the selected binary path
-                    sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$binary_path' WHERE id = $repo_id;"
-                    echo -e "${GREEN}Binary registered: $binary_path${NC}"
-                else
+                local browse_status=$?
+                # Clear the screen again after returning from the browser
+                printf "\033c"
+                if [ $browse_status -ne 0 ]; then
+                    echo -e "${YELLOW}Binary selection cancelled${NC}"
                     return 1
                 fi
+                
+                # Verify the selected binary exists and is executable
+                if [ ! -x "$binary_path" ]; then
+                    echo -e "${RED}Error: Selected binary is not executable${NC}"
+                    return 1
+                fi
+                
+                # Save the selected binary path
+                sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$binary_path' WHERE id = $repo_id;"
+                echo -e "${GREEN}Binary registered: $binary_path${NC}"
             else
                 return 1
             fi
@@ -1474,7 +1798,7 @@ main_menu() {
         echo "2) Edit repository"
         echo "3) Remove repository"
         echo "4) Download and build"
-        echo "5) See build details"
+        echo "5) See/edit build details"
         echo "6) Configure build options"
         echo "7) Launch binary"
         echo "8) Update all repositories"
@@ -1496,6 +1820,12 @@ main_menu() {
                 ;;
             5)
                 read -rp "Enter repository ID to view details: " id
+                # Validate that ID is provided and is a number
+                if [[ -z "$id" ]] || ! [[ "$id" =~ ^[0-9]+$ ]]; then
+                    error "Invalid repository ID: $id"
+                    read -n 1 -s -r -p "Press any key to continue..."
+                    continue
+                fi
                 show_build_details "$id" || continue
                 ;;
             6)
