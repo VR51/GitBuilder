@@ -18,3 +18,12 @@ URL: https://github.com/atari800/atari800.git
 
 Name: ZEsarUX
 URL: https://github.com/chernandezba/zesarux.git
+Flags: --enable-ssl
+
+## MAME
+
+Name: MAME
+URL: https://github.com/mamedev/mame.git
+Flags: REGENIE=1 TOOLS=1 NOWERROR=1 ARCHOPTS=-U_FORTIFY_SOURCE
+
+Note: MAME may take a long time to build depending on your copmuter build and available system resources.
