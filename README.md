@@ -15,7 +15,7 @@ GitBuilder is a powerful command-line tool for managing GitHub repositories, aut
 - **Interactive File Browser**: Browse directories and select executable files with an intuitive interface
 - **Dependency Management**: Specify and automatically install software dependencies for each repository
 - **Custom Build File Support**: Specify custom build file paths for repositories
-- **gitbuildfile Support**: Override auto-detection with a custom build configuration file
+- [**gitbuildfile Support**](https://github.com/VR51/GitBuilder/blob/main/README.md#gitbuildfile-support): Override auto-detection with a custom build configuration file. Ask your favourite Gits to include a gitbuildfile in their project to automate the build process.
 
 ## Installation
 
