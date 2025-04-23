@@ -3,9 +3,9 @@
 # GitBuilder - GitHub repository management and build automation tool
 # Author: Cascade
 # Prompt Engineer: VR51
-# Version: 1.0.1
+# Version: 1.0.2
 # Created: 2025-04-11
-# Updated: 2025-04-14
+# Updated: 2025-04-15
 # License: GNU General Public License v3.0
 # Donate: https://paypal.me/vr51/
 #
@@ -87,6 +87,68 @@ check_requirements() {
     fi
 }
 
+# Check for and install build dependencies
+check_build_dependencies() {
+    local repo_id="$1"
+    local dependencies
+    
+    # Get dependencies from database
+    dependencies=$(sqlite3 "$DB_FILE" "SELECT dependencies FROM build_configs WHERE repo_id = $repo_id;")
+    
+    if [ -z "$dependencies" ]; then
+        return 0  # No dependencies specified
+    fi
+    
+    echo -e "\n${BLUE}Checking build dependencies...${NC}"
+    
+    # Convert space-separated string to array
+    IFS=' ' read -r -a deps_array <<< "$dependencies"
+    
+    local missing=0
+    local missing_deps=()
+    
+    # Check each dependency
+    for dep in "${deps_array[@]}"; do
+        if ! dpkg -l | grep -q "$dep"; then
+            echo -e "${YELLOW}Missing dependency: $dep${NC}"
+            missing_deps+=("$dep")
+            missing=1
+        else
+            echo -e "${GREEN}Dependency found: $dep${NC}"
+        fi
+    done
+    
+    if [ $missing -eq 1 ]; then
+        echo -e "\nThe following dependencies need to be installed:"
+        printf '%s\n' "${missing_deps[@]}"
+        read -rp "Would you like to install them now? (y/N): " choice
+        
+        if [[ $choice =~ ^[Yy]$ ]]; then
+            if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update && sudo apt-get install -y "${missing_deps[@]}"
+            elif command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y "${missing_deps[@]}"
+            elif command -v pacman >/dev/null 2>&1; then
+                sudo pacman -S --noconfirm "${missing_deps[@]}"
+            else
+                error "Unsupported package manager. Please install required packages manually."
+                return 1
+            fi
+            echo -e "${GREEN}Dependencies installed successfully${NC}"
+        else
+            echo -e "${YELLOW}Warning: Missing dependencies may cause build to fail${NC}"
+            read -rp "Continue anyway? (y/N): " continue_choice
+            if [[ ! $continue_choice =~ ^[Yy]$ ]]; then
+                return 1
+            fi
+        fi
+    else
+        echo -e "${GREEN}All dependencies are installed${NC}"
+    fi
+    
+    return 0
+}
+
 # Initialize SQLite database
 init_db() {
     # Drop the old table if it exists (only during initialization)
@@ -107,6 +169,7 @@ CREATE TABLE IF NOT EXISTS repositories (
     build_success INTEGER,
     binary_path TEXT,
     build_type TEXT,
+    build_file_path TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     deleted INTEGER DEFAULT 0
 );
@@ -116,6 +179,7 @@ CREATE TABLE IF NOT EXISTS build_configs (
     configure_flags TEXT,
     make_flags TEXT,
     cmake_flags TEXT,
+    dependencies TEXT,
     FOREIGN KEY(repo_id) REFERENCES repositories(id)
 );
 EOF
@@ -126,6 +190,12 @@ EOF
     
     sqlite3 "$DB_FILE" "PRAGMA table_info(repositories);" | grep -q "build_type" || \
         sqlite3 "$DB_FILE" "ALTER TABLE repositories ADD COLUMN build_type TEXT;"
+        
+    sqlite3 "$DB_FILE" "PRAGMA table_info(repositories);" | grep -q "build_file_path" || \
+        sqlite3 "$DB_FILE" "ALTER TABLE repositories ADD COLUMN build_file_path TEXT;"
+        
+    sqlite3 "$DB_FILE" "PRAGMA table_info(build_configs);" | grep -q "dependencies" || \
+        sqlite3 "$DB_FILE" "ALTER TABLE build_configs ADD COLUMN dependencies TEXT;"
 }
 
 # Handle errors gracefully
@@ -300,6 +370,117 @@ get_last_commit_date() {
     fi
     
     echo "$commit_date"
+}
+
+# Parse gitbuildfile
+parse_gitbuildfile() {
+    local repo_dir="$1"
+    local repo_id="$2"
+    local gitbuildfile="$repo_dir/gitbuildfile"
+    
+    # Check if gitbuildfile exists
+    if [ ! -f "$gitbuildfile" ]; then
+        return 1
+    fi
+    
+    echo -e "\n${BLUE}Found gitbuildfile. Using build information from file...${NC}"
+    
+    # Read gitbuildfile contents
+    local repo_name=""
+    local build_method=""
+    local dependencies=""
+    local build_file=""
+    local configure_flags=""
+    local make_flags=""
+    local cmake_flags=""
+    local binary_path=""
+    
+    # Parse each line in the file
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ $line =~ ^[[:space:]]*# ]] && continue
+        [[ -z $line ]] && continue
+        
+        # Extract key-value pairs
+        if [[ $line =~ ^([A-Za-z_]+)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            
+            # Remove quotes if present
+            value="${value#\"}"
+            value="${value%\"}"
+            value="${value#'}"
+            value="${value%'}"
+            
+            case "$key" in
+                REPO_NAME)
+                    repo_name="$value"
+                    ;;
+                BUILD_METHOD)
+                    build_method="$value"
+                    ;;
+                DEPENDENCIES)
+                    dependencies="$value"
+                    ;;
+                BUILD_FILE)
+                    build_file="$value"
+                    ;;
+                CONFIGURE_FLAGS)
+                    configure_flags="$value"
+                    ;;
+                MAKE_FLAGS)
+                    make_flags="$value"
+                    ;;
+                CMAKE_FLAGS)
+                    cmake_flags="$value"
+                    ;;
+                BINARY_PATH)
+                    binary_path="$value"
+                    ;;
+            esac
+        fi
+    done < "$gitbuildfile"
+    
+    # Update database with gitbuildfile information
+    if [ -n "$build_method" ]; then
+        sqlite3 "$DB_FILE" "UPDATE repositories SET build_type = '$build_method' WHERE id = $repo_id;"
+    fi
+    
+    if [ -n "$build_file" ]; then
+        # Check if the build file path is relative or absolute
+        if [[ "$build_file" != /* ]]; then
+            build_file="$repo_dir/$build_file"
+        fi
+        sqlite3 "$DB_FILE" "UPDATE repositories SET build_file_path = '$build_file' WHERE id = $repo_id;"
+    fi
+    
+    if [ -n "$binary_path" ]; then
+        # Check if the binary path is relative or absolute
+        if [[ "$binary_path" != /* ]]; then
+            binary_path="$repo_dir/$binary_path"
+        fi
+        sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$binary_path' WHERE id = $repo_id;"
+    fi
+    
+    # Update build configuration
+    if [ -n "$configure_flags" ]; then
+        update_build_config "$repo_id" "configure_flags" "$configure_flags"
+    fi
+    
+    if [ -n "$make_flags" ]; then
+        update_build_config "$repo_id" "make_flags" "$make_flags"
+    fi
+    
+    if [ -n "$cmake_flags" ]; then
+        update_build_config "$repo_id" "cmake_flags" "$cmake_flags"
+    fi
+    
+    if [ -n "$dependencies" ]; then
+        update_build_config "$repo_id" "dependencies" "$dependencies"
+    fi
+    
+    echo -e "${GREEN}Successfully parsed gitbuildfile${NC}"
+    return 0
 }
 
 # Find build files recursively up to depth 2
@@ -505,12 +686,12 @@ get_build_config() {
     
     # Get build configuration from database
     local config
-    config=$(sqlite3 "$DB_FILE" "SELECT configure_flags, make_flags, cmake_flags FROM build_configs WHERE repo_id = $repo_id;")
+    config=$(sqlite3 "$DB_FILE" "SELECT configure_flags, make_flags, cmake_flags, dependencies FROM build_configs WHERE repo_id = $repo_id;")
     
     # If no config exists, create an empty one
     if [ -z "$config" ]; then
-        sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags) VALUES ($repo_id, '', '', '');"
-        echo "|||"
+        sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies) VALUES ($repo_id, '', '', '', '');"
+        echo "||||"
     else
         echo "$config"
     fi
@@ -533,16 +714,20 @@ update_build_config() {
         # Create a new build config entry
         case "$field" in
             configure_flags)
-                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags) 
-                    VALUES ($repo_id, '$value', '', '');"
+                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies) 
+                    VALUES ($repo_id, '$value', '', '', '');"
                 ;;
             make_flags)
-                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags) 
-                    VALUES ($repo_id, '', '$value', '');"
+                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies) 
+                    VALUES ($repo_id, '', '$value', '', '');"
                 ;;
             cmake_flags)
-                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags) 
-                    VALUES ($repo_id, '', '', '$value');"
+                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies) 
+                    VALUES ($repo_id, '', '', '$value', '');"
+                ;;
+            dependencies)
+                sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies) 
+                    VALUES ($repo_id, '', '', '', '$value');"
                 ;;
         esac
     else
@@ -1096,8 +1281,19 @@ execute_build() {
 build_package() {
     local dir="$1"
     local repo_id="$2"
-    local build_files
-    build_files=($(find_build_files "$dir" 2))
+    local build_files=()
+    
+    # Check if a custom build file path is specified in the database
+    local custom_build_file
+    custom_build_file=$(sqlite3 "$DB_FILE" "SELECT build_file_path FROM repositories WHERE id = $repo_id;")
+    
+    if [ -n "$custom_build_file" ] && [ -f "$custom_build_file" ]; then
+        echo -e "${BLUE}Using custom build file: $custom_build_file${NC}"
+        build_files=("$custom_build_file")
+    else
+        # If no custom build file, use auto-detection
+        build_files=($(find_build_files "$dir" 2))
+    fi
     
     if [ ${#build_files[@]} -eq 0 ]; then
         error "No recognized build system found in $dir (searched 2 levels deep)"
@@ -1385,6 +1581,17 @@ download_build() {
         fi
     fi
     
+    # Check for gitbuildfile and parse it if found
+    if ! parse_gitbuildfile "$repo_dir" "$id"; then
+        echo -e "${YELLOW}No gitbuildfile found. Using auto-detection...${NC}"
+    fi
+    
+    # Check for dependencies before building
+    if ! check_build_dependencies "$id"; then
+        error "Failed to resolve dependencies"
+        return 1
+    fi
+    
     echo "Building package..."
     build_package "$repo_dir" "$id"
     
@@ -1429,7 +1636,7 @@ show_build_details() {
         # Get repository details
         local repo_info
         repo_info=$(sqlite3 "$DB_FILE" "SELECT name, url, last_commit, last_commit_check, last_built, 
-            build_success, binary_path, build_type, created_at FROM repositories WHERE id = $repo_id;")
+            build_success, binary_path, build_type, build_file_path, created_at FROM repositories WHERE id = $repo_id;")
         
         if [ -z "$repo_info" ]; then
             error "Repository ID $repo_id not found"
@@ -1437,12 +1644,12 @@ show_build_details() {
         fi
         
         # Parse repository info
-        local name url last_commit last_commit_check last_built build_success binary_path build_type created_at
-        IFS='|' read -r name url last_commit last_commit_check last_built build_success binary_path build_type created_at <<< "$repo_info"
+        local name url last_commit last_commit_check last_built build_success binary_path build_type build_file_path created_at
+        IFS='|' read -r name url last_commit last_commit_check last_built build_success binary_path build_type build_file_path created_at <<< "$repo_info"
         
         # Get build configuration
-        local configure_flags make_flags cmake_flags
-        IFS='|' read -r configure_flags make_flags cmake_flags <<< "$(get_build_config "$repo_id")"
+        local configure_flags make_flags cmake_flags dependencies
+        IFS='|' read -r configure_flags make_flags cmake_flags dependencies <<< "$(get_build_config "$repo_id")"
         
         # Format build success status
         local build_status="Unknown"
@@ -1491,20 +1698,22 @@ show_build_details() {
         echo -e "8) ${YELLOW}Build type:${NC}        $build_type (not editable)"
         echo -e "9) ${YELLOW}Binary status:${NC}     $binary_status (not editable)"
         echo -e "10) ${YELLOW}Binary path:${NC}       $binary_path"
+        echo -e "11) ${YELLOW}Build file path:${NC}   $build_file_path"
         
         echo -e "\n${BLUE}Build Configuration${NC}"
-        echo -e "11) ${YELLOW}Configure flags:${NC}   $configure_flags"
-        echo -e "12) ${YELLOW}Make flags:${NC}        $make_flags"
-        echo -e "13) ${YELLOW}CMake flags:${NC}       $cmake_flags"
+        echo -e "12) ${YELLOW}Configure flags:${NC}   $configure_flags"
+        echo -e "13) ${YELLOW}Make flags:${NC}        $make_flags"
+        echo -e "14) ${YELLOW}CMake flags:${NC}       $cmake_flags"
+        echo -e "15) ${YELLOW}Dependencies:${NC}      $dependencies"
         
         echo -e "\n${BLUE}Actions${NC}"
-        echo -e "14) Rebuild repository"
-        echo -e "15) Launch binary"
+        echo -e "16) Rebuild repository"
+        echo -e "17) Launch binary"
         echo -e "0) Return to main menu"
         
         # Get user choice
         echo
-        read -rp "Select an option (0-15): " choice
+        read -rp "Select an option (0-17): " choice
         
         case "$choice" in
             0) return 0 ;;
@@ -1585,7 +1794,68 @@ show_build_details() {
                         ;;
                 esac
                 ;;
-            11) # Edit configure flags
+            11) # Edit build file path
+                echo -e "${BLUE}Current build file path: $build_file_path${NC}"
+                echo "1) Browse for build file"
+                echo "2) Enter path manually"
+                read -rp "Select an option: " build_file_choice
+                
+                case "$build_file_choice" in
+                    1) # Browse for build file
+                        local src_dir="$SRC_DIR/$name"
+                        
+                        # Check if directory exists
+                        if [ ! -d "$src_dir" ]; then
+                            echo -e "${RED}Error: Source directory $src_dir does not exist${NC}"
+                            echo -e "${YELLOW}Creating directory...${NC}"
+                            mkdir -p "$src_dir"
+                            sleep 2
+                        fi
+                        
+                        # Run the file browser directly
+                        echo -e "${BLUE}Starting file browser...${NC}"
+                        
+                        # Call browse_for_binary directly (not capturing output)
+                        browse_for_binary "$src_dir"
+                        
+                        # If we get here, the user either selected a file or quit
+                        # Check if a file path was saved to a temporary file
+                        if [ -f "/tmp/gitbuilder_selected_binary" ]; then
+                            local selected_file=$(cat "/tmp/gitbuilder_selected_binary")
+                            rm -f "/tmp/gitbuilder_selected_binary"
+                            
+                            if [ -n "$selected_file" ] && [ -f "$selected_file" ]; then
+                                # Update the database with the selected file path
+                                sqlite3 "$DB_FILE" "UPDATE repositories SET build_file_path = '$selected_file' WHERE id = $repo_id;"
+                                echo -e "${GREEN}Build file path updated: $selected_file${NC}"
+                                sleep 2
+                            else
+                                echo -e "${RED}Error: Selected file does not exist${NC}"
+                                sleep 2
+                            fi
+                        else
+                            echo -e "${YELLOW}No file selected${NC}"
+                            sleep 1
+                        fi
+                        ;;
+                    2) # Enter path manually
+                        read -rp "Enter new build file path: " new_path
+                        if [ -n "$new_path" ] && [ -f "$new_path" ]; then
+                            sqlite3 "$DB_FILE" "UPDATE repositories SET build_file_path = '$new_path' WHERE id = $repo_id;"
+                            echo -e "${GREEN}Build file path updated${NC}"
+                            sleep 1
+                        elif [ -n "$new_path" ]; then
+                            echo -e "${RED}Error: File does not exist${NC}"
+                            sleep 2
+                        fi
+                        ;;
+                    *) 
+                        echo -e "${RED}Invalid option${NC}"
+                        sleep 1
+                        ;;
+                esac
+                ;;
+            12) # Edit configure flags
                 read -rp "Enter new configure flags: " new_flags
                 if [ -n "$new_flags" ] || [ -z "$new_flags" ]; then
                     update_build_config "$repo_id" "configure_flags" "$new_flags"
@@ -1593,7 +1863,7 @@ show_build_details() {
                     sleep 1
                 fi
                 ;;
-            12) # Edit make flags
+            13) # Edit make flags
                 read -rp "Enter new make flags: " new_flags
                 if [ -n "$new_flags" ] || [ -z "$new_flags" ]; then
                     update_build_config "$repo_id" "make_flags" "$new_flags"
@@ -1601,7 +1871,7 @@ show_build_details() {
                     sleep 1
                 fi
                 ;;
-            13) # Edit CMake flags
+            14) # Edit CMake flags
                 read -rp "Enter new CMake flags: " new_flags
                 if [ -n "$new_flags" ] || [ -z "$new_flags" ]; then
                     update_build_config "$repo_id" "cmake_flags" "$new_flags"
@@ -1609,14 +1879,22 @@ show_build_details() {
                     sleep 1
                 fi
                 ;;
-            14) # Rebuild repository
+            15) # Edit dependencies
+                read -rp "Enter software dependencies (space-separated): " new_deps
+                if [ -n "$new_deps" ] || [ -z "$new_deps" ]; then
+                    update_build_config "$repo_id" "dependencies" "$new_deps"
+                    echo -e "${GREEN}Dependencies updated${NC}"
+                    sleep 1
+                fi
+                ;;
+            16) # Rebuild repository
                 printf "\033c"
                 echo -e "${BLUE}Rebuilding repository $name...${NC}"
                 download_build "$repo_id" "rebuild"
                 echo -e "\n${GREEN}Rebuild complete${NC}"
                 sleep 2
                 ;;
-            15) # Launch binary
+            17) # Launch binary
                 printf "\033c"
                 launch_binary "$repo_id"
                 echo -e "\n${GREEN}Press any key to continue...${NC}"
@@ -1799,10 +2077,9 @@ main_menu() {
         echo "3) Remove repository"
         echo "4) Download and build"
         echo "5) See/edit build details"
-        echo "6) Configure build options"
-        echo "7) Launch binary"
-        echo "8) Update all repositories"
-        echo "9) Exit"
+        echo "6) Launch binary"
+        echo "7) Update all repositories"
+        echo "8) Exit"
         
         show_repos
         
@@ -1829,20 +2106,16 @@ main_menu() {
                 show_build_details "$id" || continue
                 ;;
             6)
-                read -rp "Enter repository ID to configure: " id
-                set_build_config "$id" || continue
-                ;;
-            7)
                 read -rp "Enter repository ID to launch: " id
                 if launch_binary "$id"; then
                     echo -e "\nPress any key to continue..."
                     read -r -n 1
                 fi
                 ;;
-            8)
+            7)
                 update_all_repos || continue
                 ;;
-            9) exit 0 ;;
+            8) exit 0 ;;
             *) 
                 echo -e "${RED}Invalid option${NC}"
                 sleep 1
