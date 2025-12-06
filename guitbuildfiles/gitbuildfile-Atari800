@@ -9,7 +9,7 @@ REPO_URL="https://github.com/atari800/atari800.git"
 BUILD_METHOD=""
 
 # Space-separated list of dependencies
-DEPENDENCIES="|1|1"
+DEPENDENCIES=""
 
 # Path to the build file (relative to repo root or absolute)
 BUILD_FILE=""
