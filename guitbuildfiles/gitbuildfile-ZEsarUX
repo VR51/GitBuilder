@@ -1,0 +1,30 @@
+# GitBuilder build configuration file
+# Generated automatically by GitBuilder
+
+# Repository information
+REPO_NAME="ZEsarUX"
+REPO_URL="https://github.com/chernandezba/zesarux.git"
+
+# Build method (cmake, autotools, make, etc.)
+BUILD_METHOD=""
+
+# Space-separated list of dependencies
+DEPENDENCIES="|1|1"
+
+# Path to the build file (relative to repo root or absolute)
+BUILD_FILE=""
+
+# Configure flags for autotools/cmake
+CONFIGURE_FLAGS="--enable-ssl"
+
+# Make flags
+MAKE_FLAGS=""
+
+# CMake flags
+CMAKE_FLAGS=""
+
+# Path to the compiled binary (relative to repo root or absolute)
+BINARY_PATH="/home/lee/.local/share/gitbuilder/src/ZEsarUX/src/zesarux"
+
+# Repository notes (displayed after build)
+NOTES=""
