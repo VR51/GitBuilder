@@ -1,0 +1,104 @@
+# GitBuilder build configuration file
+# Generated automatically by GitBuilder
+
+# Repository information
+REPO_NAME="Atari800"
+REPO_URL="https://github.com/atari800/atari800.git"
+
+# Build method (cmake, autotools, make, etc.)
+BUILD_METHOD=""
+
+# Space-separated list of dependencies
+DEPENDENCIES="|1|1"
+
+# Path to the build file (relative to repo root or absolute)
+BUILD_FILE=""
+
+# Configure flags for autotools/cmake
+CONFIGURE_FLAGS=""
+
+# Make flags
+MAKE_FLAGS=""
+
+# CMake flags
+CMAKE_FLAGS=""
+
+# Path to the compiled binary (relative to repo root or absolute)
+BINARY_PATH="/home/lee/.local/share/gitbuilder/src/Atari800/src/atari800"
+
+# Repository notes (displayed after build)
+NOTES="Keyboard, joystick and other controllers
+========================================
+
+Unlike PC Xformer, I have not tried to emulate the exact keyboard layout,
+instead, I have tried to make your native keyboard work as normal.
+
+F1                   Built in user interface
+F2                   Option key
+F3                   Select key
+F4                   Start key
+F5                   Reset key ("warm reset")
+Shift+F5             Reboot ("cold reset")
+F6                   Help key (XL/XE only)
+F7                   Break key / Pause during DOS file booting (**)
+F8                   Enter monitor
+F9                   Exit emulator
+F10                  Save screenshot
+Shift+F10            Save interlaced screenshot
+F12                  Turbo mode
+Alt+R                Run Atari program
+Alt+D                Disk management
+Alt+C                Cartridge management
+Alt+T                Tape management
+Alt+Y                Select system
+Alt+O                Sound settings
+Alt+W                Sound recording start/stop
+Alt+V                Video recording start/stop
+Alt+S                Save state file
+Alt+L                Load state file
+Alt+A                About the emulator
+Shift+Insert         Insert line (Atari Shift+'>')
+Insert               Insert character (Atari Ctrl+'>')
+Shift+Ctrl+Insert    Shift+Ctrl+'>'
+Shift+Delete         Delete line (Atari Shift+Backspace)
+Shift+Backspace      Delete line (Atari Shift+Backspace)
+Delete               Delete character (Atari Ctrl+Backspace)
+Ctrl+Backspace       Delete character (Atari Ctrl+Backspace)
+Shift+Ctrl+Delete    Shift+Ctrl+Backspace
+Shift+Ctrl+Backspace Shift+Ctrl+Backspace
+Home                 Clear (Atari Shift+'<')
+Ctrl+Home            Ctrl+'<' (also clears screen)
+Shift+Ctrl+Home      Shift+Ctrl+'<'
+~                    Inverse video
+Up                   Up (Atari Ctrl+'-')
+Down                 Down (Atari Ctrl+'=')
+Left                 Left (Atari ctrl+'+')
+Right                Right (Atari ctrl+'*')
+Ctrl+Up              -
+Ctrl+Down            =
+Ctrl+Left            +
+Ctrl+Right           *
+Shift+Up             _ (Atari Shift+'-')
+Shift+Down           | (Atari Shift+'=')
+Shift+Left           \ (Atari Shift+'+')
+Shift+Right          ^ (Atari Shift+'*')
+Shift+Ctrl+Up        Shift+Ctrl+-
+Shift+Ctrl+Down      Shift+Ctrl+=
+Ctrl+'\'             Ctrl+Esc  (Workaround for Windows)
+Shift+Ctrl+'\'       Shift+Ctrl+Esc (Workaround for Windows)
+
+CX85 Keypad (if enabled):
+host keypad 0123456789-.   0123456789-.
+host keypad /              NO
+host keypad Ctrl+/         ESCAPE
+host keypad *              DELETE
+host keypad +              YES
+host keypad Enter          +ENTER
+
+Paddles, Atari touch tablet, Koala pad, light pen, light gun,
+ST/Amiga mouse, Atari trak-ball, joystick and Atari 5200 analog
+controller are emulated using mouse on ports that support it.
+See the options above for how to enable mouse.
+
+(**) When Slow booting of DOS binary files is enabled, holding F7 during
+loading pauses the booting process."
