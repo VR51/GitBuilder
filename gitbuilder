@@ -125,12 +125,17 @@ GITBUILDFILES_DIR="$SCRIPT_DIR/gitbuildfiles"
 # Additional directories
 BUILD_HISTORY_DIR="$DB_DIR/history"
 BUILD_PROFILES_DIR="$DB_DIR/profiles"
+BINARY_BACKUPS_DIR="$DB_DIR/binary_backups"
+DESKTOP_LAUNCHERS_DIR="$HOME/.local/share/applications"
 PLUGINS_DIR="$SCRIPT_DIR/plugins"
+
+# Binary backup configuration
+BINARY_BACKUP_LIMIT=3  # Maximum backups per repository
 CONFIG_FILE="$DB_DIR/config"
 BACKUP_DIR="$DB_DIR/backups"
 
 # Ensure directories exist
-mkdir -p "$DB_DIR" "$SRC_DIR" "$GITBUILDFILES_DIR" "$BUILD_HISTORY_DIR" "$BUILD_PROFILES_DIR" "$PLUGINS_DIR" "$BACKUP_DIR"
+mkdir -p "$DB_DIR" "$SRC_DIR" "$GITBUILDFILES_DIR" "$BUILD_HISTORY_DIR" "$BUILD_PROFILES_DIR" "$BINARY_BACKUPS_DIR" "$PLUGINS_DIR" "$BACKUP_DIR"
 
 # Set secure permissions on database directory
 chmod 700 "$DB_DIR" 2>/dev/null || true
@@ -541,6 +546,26 @@ CREATE TABLE IF NOT EXISTS repo_dependencies (
     depends_on_repo_id INTEGER,
     FOREIGN KEY(repo_id) REFERENCES repositories(id),
     FOREIGN KEY(depends_on_repo_id) REFERENCES repositories(id)
+);
+
+CREATE TABLE IF NOT EXISTS binary_backups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER,
+    backup_path TEXT NOT NULL,
+    original_path TEXT NOT NULL,
+    version_label TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(repo_id) REFERENCES repositories(id)
+);
+
+CREATE TABLE IF NOT EXISTS desktop_launchers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER,
+    desktop_file_path TEXT NOT NULL,
+    icon_path TEXT,
+    menu_category TEXT DEFAULT 'Development',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(repo_id) REFERENCES repositories(id)
 );
 EOF
     
@@ -1730,7 +1755,6 @@ find_binary() {
     done
 }
 
-# Handle build result
 # =============================================================================
 # UNIFIED FILE BROWSER
 # =============================================================================
@@ -1770,6 +1794,10 @@ file_browser() {
             title="FILE BROWSER - Select a directory"
             file_label="(Select a directory)"
             ;;
+        image)
+            title="FILE BROWSER - Select an image/icon"
+            file_label="IMAGE FILES"
+            ;;
     esac
     
     # Ensure the directory exists
@@ -1789,10 +1817,13 @@ file_browser() {
         clear
         echo "=========================================="
         echo "$title"
-        echo "Current directory: $current_dir"
         echo "=========================================="
+        echo ""
+        echo -e "${CYAN}Current directory:${NC}"
+        echo -e "${GREEN}$current_dir${NC}"
         
         # Show parent directory option
+        echo ""
         echo "0) .. (Go to parent directory)"
         
         # Initialize arrays for menu items
@@ -1878,17 +1909,54 @@ file_browser() {
                 ((count++)) || true
                 has_files=true
                 ;;
+            image)
+                # Show image files (png, svg, ico, xpm, jpg, jpeg)
+                for f in "$current_dir"/*; do
+                    if [ -f "$f" ]; then
+                        local ext="${f##*.}"
+                        ext="${ext,,}"  # lowercase
+                        case "$ext" in
+                            png|svg|ico|xpm|jpg|jpeg|gif|bmp|webp)
+                                local name
+                                name=$(basename "$f")
+                                echo "$count) [IMG] $name"
+                                items_path[$count]="$f"
+                                items_type[$count]="file"
+                                ((count++)) || true
+                                has_files=true
+                                ;;
+                        esac
+                    fi
+                done
+                ;;
         esac
         [ "$has_files" = false ] && echo "   (no matching files)"
         
         # Show navigation options
         echo 
-        echo "q) Quit browser"
+        echo "0) Go to parent directory"
+        echo ""
+        echo "Esc/q) Cancel and return"
         echo 
         
-        # Get user selection
-        echo -n "Select option (0-$((count-1)), q to quit): "
-        read -r choice
+        # Get user selection with Esc support
+        local choice=""
+        local char
+        echo -n "Select option (0-$((count-1)), Esc to cancel): "
+        while IFS= read -r -n1 char; do
+            # Check for Esc key
+            if [ "$char" = $'\e' ]; then
+                echo ""
+                return 1
+            fi
+            # Check for Enter key
+            if [ -z "$char" ]; then
+                echo ""
+                break
+            fi
+            # Accumulate input
+            choice+="$char"
+        done
         
         # Process the selection
         if [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
@@ -1920,8 +1988,8 @@ file_browser() {
 # Wrapper for backward compatibility
 browse_for_binary() {
     local start_dir="$1"
-    file_browser "$start_dir" "binary"
-    local status=$?
+    local status=0
+    file_browser "$start_dir" "binary" || status=$?
     # Copy to old temp file location for compatibility
     if [ -f "/tmp/gitbuilder_selected_file" ]; then
         cp "/tmp/gitbuilder_selected_file" "/tmp/gitbuilder_selected_binary"
@@ -1958,6 +2026,7 @@ handle_build_result() {
         
         if [ ${#binaries[@]} -gt 0 ]; then
             echo -e "\n${BLUE}Found potential binary files:${NC}"
+            echo ""
             local i=1
             for binary in "${binaries[@]}"; do
                 echo "$i) $binary"
@@ -1965,17 +2034,27 @@ handle_build_result() {
             done
             
             echo "b) Browse for binary"
+            echo ""
             read -rp "Select binary to register (1-${#binaries[@]}, or 'b' to browse): " choice
             
             local selected_binary
             if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#binaries[@]}" ]; then
                 selected_binary="${binaries[$choice-1]}"
             elif [[ $choice == "b" ]]; then
-                # Call the browse_for_binary function and capture its output and return code
-                selected_binary=$(browse_for_binary "$build_dir")
-                local browse_status=$?
+                # Call the browse_for_binary function directly (not in subshell)
+                local browse_status=0
+                browse_for_binary "$build_dir" || browse_status=$?
                 if [ $browse_status -ne 0 ]; then
                     echo -e "${YELLOW}Binary selection cancelled${NC}"
+                    return 1
+                fi
+                
+                # Read the selected binary from temp file
+                if [ -f "/tmp/gitbuilder_selected_file" ]; then
+                    selected_binary=$(cat "/tmp/gitbuilder_selected_file")
+                    rm -f "/tmp/gitbuilder_selected_file"
+                else
+                    echo -e "${RED}Error: No binary selected${NC}"
                     return 1
                 fi
                 
@@ -1999,25 +2078,42 @@ handle_build_result() {
             if [[ $run_choice =~ ^[Yy]$ ]]; then
                 launch_binary "$repo_id"
             fi
+            
+            # Offer to create desktop launcher
+            read -rp "Would you like to create a desktop launcher? (y/N): " launcher_choice
+            if [[ $launcher_choice =~ ^[Yy]$ ]]; then
+                create_desktop_launcher "$repo_id"
+            fi
         else
             echo -e "\n${YELLOW}No binaries found automatically.${NC}"
             read -rp "Would you like to browse for the binary? (Y/n): " browse_choice
             if [[ ! $browse_choice =~ ^[Nn]$ ]]; then
-                local selected_binary
-                # Call the browse_for_binary function and capture its output and return code
-                selected_binary=$(browse_for_binary "$build_dir")
-                local browse_status=$?
-                if [ $browse_status -eq 0 ] && [ -x "$selected_binary" ]; then
-                    echo -e "${GREEN}Selected binary: $selected_binary${NC}"
+                local browse_status=0
+                # Call the browse_for_binary function directly (not in subshell)
+                browse_for_binary "$build_dir" || browse_status=$?
+                if [ $browse_status -eq 0 ] && [ -f "/tmp/gitbuilder_selected_file" ]; then
+                    local selected_binary
+                    selected_binary=$(cat "/tmp/gitbuilder_selected_file")
+                    rm -f "/tmp/gitbuilder_selected_file"
                     
-                    # Save binary path to database
-                    sqlite3 "$DB_FILE" "UPDATE repositories SET 
-                        binary_path = '$selected_binary'
-                        WHERE id = $repo_id;"
-                    
-                    read -rp "Would you like to launch the binary now? (y/N): " run_choice
-                    if [[ $run_choice =~ ^[Yy]$ ]]; then
-                        launch_binary "$repo_id"
+                    if [ -x "$selected_binary" ]; then
+                        echo -e "${GREEN}Selected binary: $selected_binary${NC}"
+                        
+                        # Save binary path to database
+                        sqlite3 "$DB_FILE" "UPDATE repositories SET 
+                            binary_path = '$selected_binary'
+                            WHERE id = $repo_id;"
+                        
+                        read -rp "Would you like to launch the binary now? (y/N): " run_choice
+                        if [[ $run_choice =~ ^[Yy]$ ]]; then
+                            launch_binary "$repo_id"
+                        fi
+                        
+                        # Offer to create desktop launcher
+                        read -rp "Would you like to create a desktop launcher? (y/N): " launcher_choice
+                        if [[ $launcher_choice =~ ^[Yy]$ ]]; then
+                            create_desktop_launcher "$repo_id"
+                        fi
                     fi
                 fi
             fi
@@ -2627,15 +2723,33 @@ download_build() {
         fi
     fi
     
-    # Check for gitbuildfile and parse it if found
-    if ! parse_gitbuildfile "$repo_dir" "$id"; then
-        echo -e "${YELLOW}No gitbuildfile found. Using auto-detection...${NC}"
+    # Check for gitbuildfile and prompt user before using it
+    local gitbuildfile="$repo_dir/gitbuildfile"
+    if [ -f "$gitbuildfile" ]; then
+        echo -e "\n${CYAN}Found gitbuildfile in repository.${NC}"
+        read -rp "Use build configuration from gitbuildfile? (Y/n): " use_gitbuildfile
+        if [[ ! "$use_gitbuildfile" =~ ^[Nn]$ ]]; then
+            parse_gitbuildfile "$repo_dir" "$id"
+        else
+            echo -e "${YELLOW}Skipping gitbuildfile. Using existing/auto-detected settings...${NC}"
+        fi
     fi
     
     # Check for dependencies before building
     if ! check_build_dependencies "$id"; then
         error "Failed to resolve dependencies"
         return 1
+    fi
+    
+    # Offer to backup existing binary before rebuild
+    local existing_binary
+    existing_binary=$(sqlite3 "$DB_FILE" "SELECT binary_path FROM repositories WHERE id = $id;")
+    if [ -n "$existing_binary" ] && [ -f "$existing_binary" ]; then
+        echo -e "\n${YELLOW}Existing binary found: $(basename "$existing_binary")${NC}"
+        read -rp "Backup existing binary before rebuild? (Y/n): " backup_choice
+        if [[ ! "$backup_choice" =~ ^[Nn]$ ]]; then
+            backup_binary "$id" "Pre-rebuild backup"
+        fi
     fi
     
     echo "Building package..."
@@ -2756,20 +2870,19 @@ show_build_details() {
         echo -e "\n${BLUE}Actions${NC}"
         echo -e "18) Rebuild repository"
         echo -e "19) Launch binary"
+        echo -e "20) Binary backups"
+        echo -e "21) Create desktop launcher"
         
-        # Get user choice
+        # Get user choice with hotkey support (H for help, L for launch)
         echo
-        read_with_esc "Select option (1-19): " choice
-        local esc_status=$?
+        local esc_status=0
+        read_with_esc "Select option (1-21): " choice "HL" || esc_status=$?
         
-        # Handle Esc key - return to main menu
-        if [ $esc_status -eq 27 ]; then
-            return 0
-        fi
-        
-        # Handle help key
-        case $choice in
-            [Hh]) show_help_page; continue ;;
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc - return to main menu
+            72) show_help_page; continue ;;  # H - Help
+            76) launch_binary "$repo_id"; continue ;;  # L - Quick launch this repo's binary
         esac
         
         # Handle menu options
@@ -2816,12 +2929,13 @@ show_build_details() {
                         echo -e "${BLUE}Starting file browser...${NC}"
                         
                         # Call browse_for_binary directly (not capturing output)
-                        browse_for_binary "$src_dir"
+                        browse_for_binary "$src_dir" || true
                         
                         # If we get here, the user either selected a binary or quit
                         # Check if a binary path was saved to a temporary file
                         if [ -f "/tmp/gitbuilder_selected_binary" ]; then
-                            local selected_binary=$(cat "/tmp/gitbuilder_selected_binary")
+                            local selected_binary
+                            selected_binary=$(cat "/tmp/gitbuilder_selected_binary")
                             rm -f "/tmp/gitbuilder_selected_binary"
                             
                             if [ -n "$selected_binary" ] && [ -x "$selected_binary" ]; then
@@ -2883,12 +2997,13 @@ show_build_details() {
                         echo -e "${BLUE}Starting file browser...${NC}"
                         
                         # Call browse_for_binary directly (not capturing output)
-                        browse_for_binary "$src_dir"
+                        browse_for_binary "$src_dir" || true
                         
                         # If we get here, the user either selected a file or quit
                         # Check if a file path was saved to a temporary file
                         if [ -f "/tmp/gitbuilder_selected_binary" ]; then
-                            local selected_file=$(cat "/tmp/gitbuilder_selected_binary")
+                            local selected_file
+                            selected_file=$(cat "/tmp/gitbuilder_selected_binary")
                             rm -f "/tmp/gitbuilder_selected_binary"
                             
                             if [ -n "$selected_file" ] && [ -f "$selected_file" ]; then
@@ -2999,6 +3114,12 @@ show_build_details() {
                 echo -e "\n${GREEN}Press any key to continue...${NC}"
                 read -r -n 1
                 ;;
+            20) # Binary backups
+                binary_backups_menu "$repo_id"
+                ;;
+            21) # Create desktop launcher
+                create_desktop_launcher "$repo_id"
+                ;;
             *) 
                 echo -e "${RED}Invalid option${NC}"
                 sleep 1
@@ -3042,6 +3163,7 @@ launch_binary() {
         
         if [ ${#binaries[@]} -gt 0 ]; then
             echo -e "\n${BLUE}Found potential binary files:${NC}"
+            echo ""
             local i=1
             for binary in "${binaries[@]}"; do
                 echo "$i) $binary"
@@ -3050,6 +3172,7 @@ launch_binary() {
             
             echo "b) Browse for binary"
             local choice
+            echo ""
             read -rp "Select binary to register (1-${#binaries[@]}, or 'b' to browse): " choice
             
             if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#binaries[@]}" ]; then
@@ -3057,13 +3180,22 @@ launch_binary() {
             elif [[ $choice == "b" ]]; then
                 # Clear the screen before calling the browser to avoid display issues
                 printf "\033c"
-                # Call the browse_for_binary function and capture its output and return code
-                binary_path=$(browse_for_binary "$src_dir")
-                local browse_status=$?
+                # Call the browse_for_binary function directly (not in subshell)
+                local browse_status=0
+                browse_for_binary "$src_dir" || browse_status=$?
                 # Clear the screen again after returning from the browser
                 printf "\033c"
                 if [ $browse_status -ne 0 ]; then
                     echo -e "${YELLOW}Binary selection cancelled${NC}"
+                    return 1
+                fi
+                
+                # Read the selected binary from temp file
+                if [ -f "/tmp/gitbuilder_selected_file" ]; then
+                    binary_path=$(cat "/tmp/gitbuilder_selected_file")
+                    rm -f "/tmp/gitbuilder_selected_file"
+                else
+                    echo -e "${RED}Error: No binary selected${NC}"
                     return 1
                 fi
                 
@@ -3086,13 +3218,22 @@ launch_binary() {
             if [[ ! $browse_choice =~ ^[Nn]$ ]]; then
                 # Clear the screen before calling the browser to avoid display issues
                 printf "\033c"
-                # Call the browse_for_binary function and capture its output and return code
-                binary_path=$(browse_for_binary "$src_dir")
-                local browse_status=$?
+                # Call the browse_for_binary function directly (not in subshell)
+                local browse_status=0
+                browse_for_binary "$src_dir" || browse_status=$?
                 # Clear the screen again after returning from the browser
                 printf "\033c"
                 if [ $browse_status -ne 0 ]; then
                     echo -e "${YELLOW}Binary selection cancelled${NC}"
+                    return 1
+                fi
+                
+                # Read the selected binary from temp file
+                if [ -f "/tmp/gitbuilder_selected_file" ]; then
+                    binary_path=$(cat "/tmp/gitbuilder_selected_file")
+                    rm -f "/tmp/gitbuilder_selected_file"
+                else
+                    echo -e "${RED}Error: No binary selected${NC}"
                     return 1
                 fi
                 
@@ -3156,11 +3297,14 @@ save_gitbuildfile() {
     build_file_path=$(echo "$repo_info" | cut -d'|' -f4)
     binary_path=$(echo "$repo_info" | cut -d'|' -f5)
     
-    # Get build configuration
+    # Get build configuration - use cut to extract specific fields to handle any corrupted data
     local build_config
     build_config=$(get_build_config "$repo_id")
     local configure_flags make_flags cmake_flags dependencies
-    IFS='|' read -r configure_flags make_flags cmake_flags dependencies <<< "$build_config"
+    configure_flags=$(echo "$build_config" | cut -d'|' -f1)
+    make_flags=$(echo "$build_config" | cut -d'|' -f2)
+    cmake_flags=$(echo "$build_config" | cut -d'|' -f3)
+    dependencies=$(echo "$build_config" | cut -d'|' -f4)
     
     # Get notes
     local notes
@@ -3443,17 +3587,13 @@ repository_notes_menu() {
         echo "3) Change editor"
         
         echo ""
-        read_with_esc "Select option: " choice
-        local esc_status=$?
+        local esc_status=0
+        read_with_esc "Select option: " choice "H" || esc_status=$?
         
-        # Handle Esc key - return to main menu
-        if [ $esc_status -eq 27 ]; then
-            return 0
-        fi
-        
-        # Handle help key
-        case $choice in
-            [Hh]) show_help_page; continue ;;
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc - return to main menu
+            72) show_help_page; continue ;;  # H - Help
         esac
         
         # Handle menu options
@@ -3607,7 +3747,7 @@ main_menu() {
         echo "4) Search repositories"
         echo ""
         echo -e "${CYAN}Build Operations${NC}"
-        echo "5) Download and build"
+        echo "5) Download and build a repository"
         echo "6) Build queue"
         echo "7) Build profiles"
         echo "8) Build history"
@@ -3626,20 +3766,25 @@ main_menu() {
         echo "15) Refresh Git repository information"
         echo "16) Settings"
         
-        # Read input with timeout to catch Esc key
+        # Read input with hotkey support
         echo ""
-        read_with_esc "Select option: " choice
-        local esc_status=$?
+        local esc_status=0
+        read_with_esc "Select option: " choice "HL" || esc_status=$?
         
-        # Handle Esc key - exit from main menu
-        if [ $esc_status -eq 27 ]; then
-            echo -e "\n${YELLOW}Exiting GitBuilder...${NC}"
-            exit 0
-        fi
-        
-        # Handle help key
-        case $choice in
-            [Hh]) show_help_page; continue ;;
+        # Handle hotkeys
+        case $esc_status in
+            27) # Esc - exit from main menu
+                echo -e "\n${YELLOW}Exiting GitBuilder...${NC}"
+                exit 0
+                ;;
+            72) # H - Help
+                show_help_page
+                continue
+                ;;
+            76) # L - Quick Launch
+                quick_launch
+                continue
+                ;;
         esac
         
         # Handle menu options
@@ -3710,10 +3855,14 @@ show_repository_table() {
     render_table "Available Repositories:" "2|8|20|5|5|3"
 }
 
-# Read input with immediate Esc key detection
+# Read input with immediate Esc key detection and hotkey support
+# Returns: 0 = normal input, 27 = Esc, 72 = H (help), 76 = L (launch)
+# Usage: read_with_esc "prompt" variable [hotkeys]
+#   hotkeys: string of enabled hotkeys, e.g., "HL" for Help and Launch
 read_with_esc() {
 	local prompt="$1"
 	local _out_var="${2:-}"
+	local hotkeys="${3:-HL}"  # Default: H and L enabled
 	local input=""
 	local char
 	
@@ -3725,6 +3874,20 @@ read_with_esc() {
 		if [ "$char" = $'\e' ]; then
 			echo ""
 			return 27  # Return code for Esc
+		fi
+		
+		# Check for hotkeys only when input is empty (first character)
+		if [ -z "$input" ]; then
+			# H for Help
+			if [[ "$hotkeys" == *"H"* ]] && [[ "$char" == "H" || "$char" == "h" ]]; then
+				echo ""
+				return 72  # Return code for Help
+			fi
+			# L for Launch
+			if [[ "$hotkeys" == *"L"* ]] && [[ "$char" == "L" || "$char" == "l" ]]; then
+				echo ""
+				return 76  # Return code for Launch
+			fi
 		fi
 		
 		# Check for Enter key (read -n1 returns empty string for Enter)
@@ -3752,11 +3915,85 @@ read_with_esc() {
 			# No extra echo here; terminal already echoed the char
 		fi
 	done
+	
+	# If we get here, EOF was reached - treat as Esc
+	echo ""
+	return 27
 }
 
 # Display common key shortcuts
 show_common_keys() {
-    echo -e "${GRAY}Esc = Back/Exit | H = Help${NC}"
+    echo ""
+    echo -e "${GRAY}Esc = Back/Exit | H = Help | L = Quick Launch${NC}"
+}
+
+# Quick launch - prompt user to select and launch a binary
+quick_launch() {
+    echo -e "\n${BLUE}Quick Launch${NC}"
+    
+    # Get list of repositories with binaries
+    local repos_with_binaries
+    repos_with_binaries=$(sqlite3 "$DB_FILE" "SELECT id, name, binary_path FROM repositories WHERE deleted = 0 AND binary_path IS NOT NULL AND binary_path != '' ORDER BY name;")
+    
+    if [ -z "$repos_with_binaries" ]; then
+        echo -e "${YELLOW}No repositories have registered binaries.${NC}"
+        echo -e "Use 'Launch binary' (option 10) to register a binary first."
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    echo -e "\n${CYAN}Select a binary to launch:${NC}"
+    local -a repo_ids=()
+    local -a repo_names=()
+    local -a binary_paths=()
+    local count=1
+    
+    while IFS='|' read -r id name binary_path; do
+        local binary_name
+        binary_name=$(basename "$binary_path")
+        echo "$count) $name ($binary_name)"
+        repo_ids+=("$id")
+        repo_names+=("$name")
+        binary_paths+=("$binary_path")
+        ((count++))
+    done <<< "$repos_with_binaries"
+    
+    echo ""
+    read -rp "Select (1-$((count-1)), or Enter to cancel): " selection
+    
+    if [ -z "$selection" ]; then
+        return 0
+    fi
+    
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -lt "$count" ]; then
+        local idx=$((selection - 1))
+        local selected_id="${repo_ids[$idx]}"
+        local selected_name="${repo_names[$idx]}"
+        local selected_binary="${binary_paths[$idx]}"
+        
+        if [ -x "$selected_binary" ]; then
+            echo -e "\n${GREEN}Launching $selected_name...${NC}"
+            echo "1) Quiet (background)"
+            echo "2) Verbose (show output)"
+            read -rp "Launch mode (1/2): " mode
+            
+            if [ "$mode" = "1" ]; then
+                nohup "$selected_binary" >/dev/null 2>&1 &
+                echo -e "${GREEN}Launched in background (PID: $!)${NC}"
+            else
+                echo -e "${BLUE}Running $selected_binary...${NC}"
+                "$selected_binary"
+            fi
+            read -rp "Press Enter to continue..."
+        else
+            echo -e "${RED}Binary not found or not executable: $selected_binary${NC}"
+            read -rp "Press Enter to continue..."
+            return 1
+        fi
+    else
+        echo -e "${RED}Invalid selection${NC}"
+        return 1
+    fi
 }
 
 # Show help page
@@ -3768,7 +4005,8 @@ show_help_page() {
     echo ""
     echo -e "${BLUE}Keyboard Shortcuts${NC}"
     echo "  Esc     - Return to previous screen / Exit from main menu"
-    echo "  H       - Show this help page (from any screen)"
+    echo "  H       - Show this help page (from any menu)"
+    echo "  L       - Quick launch a binary (main menu & build details)"
     echo "  0-9     - Select menu options"
     echo ""
     echo -e "${BLUE}Main Menu Categories${NC}"
@@ -3982,6 +4220,530 @@ auto_backup() {
 }
 
 # =============================================================================
+# BINARY BACKUP FUNCTIONS
+# =============================================================================
+
+# Count binary backups for a repository
+count_binary_backups() {
+    local repo_id="$1"
+    sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM binary_backups WHERE repo_id = $repo_id;"
+}
+
+# Get binary backups for a repository
+get_binary_backups() {
+    local repo_id="$1"
+    sqlite3 "$DB_FILE" "SELECT id, backup_path, version_label, created_at FROM binary_backups WHERE repo_id = $repo_id ORDER BY created_at DESC;"
+}
+
+# Create a backup of the current binary before rebuild
+backup_binary() {
+    local repo_id="$1"
+    local version_label="${2:-}"
+    
+    # Get current binary path
+    local binary_path
+    binary_path=$(sqlite3 "$DB_FILE" "SELECT binary_path FROM repositories WHERE id = $repo_id;")
+    
+    if [ -z "$binary_path" ] || [ ! -f "$binary_path" ]; then
+        return 1  # No binary to backup
+    fi
+    
+    # Get repository name
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;")
+    
+    # Check backup count and warn if at limit
+    local backup_count
+    backup_count=$(count_binary_backups "$repo_id")
+    
+    if [ "$backup_count" -ge "$BINARY_BACKUP_LIMIT" ]; then
+        echo -e "${YELLOW}Warning: You have $backup_count backups (limit: $BINARY_BACKUP_LIMIT).${NC}"
+        echo -e "${YELLOW}The oldest backup will be deleted if you continue.${NC}"
+        read -rp "Continue with backup? (Y/n): " confirm
+        if [[ "$confirm" =~ ^[Nn]$ ]]; then
+            return 1
+        fi
+        
+        # Delete oldest backup
+        local oldest_id oldest_path
+        oldest_id=$(sqlite3 "$DB_FILE" "SELECT id FROM binary_backups WHERE repo_id = $repo_id ORDER BY created_at ASC LIMIT 1;")
+        oldest_path=$(sqlite3 "$DB_FILE" "SELECT backup_path FROM binary_backups WHERE id = $oldest_id;")
+        
+        if [ -n "$oldest_path" ] && [ -f "$oldest_path" ]; then
+            rm -f "$oldest_path"
+        fi
+        sqlite3 "$DB_FILE" "DELETE FROM binary_backups WHERE id = $oldest_id;"
+        echo -e "${CYAN}Deleted oldest backup${NC}"
+    fi
+    
+    # Create backup directory for this repo
+    local repo_backup_dir="$BINARY_BACKUPS_DIR/$repo_name"
+    mkdir -p "$repo_backup_dir"
+    
+    # Generate backup filename with timestamp
+    local binary_name
+    binary_name=$(basename "$binary_path")
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_path="$repo_backup_dir/${binary_name}_${timestamp}"
+    
+    # Copy binary to backup location
+    if cp "$binary_path" "$backup_path"; then
+        chmod +x "$backup_path"
+        
+        # Generate version label if not provided
+        if [ -z "$version_label" ]; then
+            version_label="Backup $(date '+%Y-%m-%d %H:%M')"
+        fi
+        
+        # Record in database
+        local escaped_backup_path escaped_original_path escaped_label
+        escaped_backup_path=$(sql_escape "$backup_path")
+        escaped_original_path=$(sql_escape "$binary_path")
+        escaped_label=$(sql_escape "$version_label")
+        
+        sqlite3 "$DB_FILE" "INSERT INTO binary_backups (repo_id, backup_path, original_path, version_label) VALUES ($repo_id, '$escaped_backup_path', '$escaped_original_path', '$escaped_label');"
+        
+        echo -e "${GREEN}Binary backed up: $backup_path${NC}"
+        return 0
+    else
+        echo -e "${RED}Failed to backup binary${NC}"
+        return 1
+    fi
+}
+
+# List binary backups for a repository
+list_binary_backups() {
+    local repo_id="$1"
+    
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;")
+    
+    echo -e "\n${BLUE}Binary Backups for $repo_name:${NC}"
+    
+    local backups
+    backups=$(get_binary_backups "$repo_id")
+    
+    if [ -z "$backups" ]; then
+        echo -e "${YELLOW}No backups found${NC}"
+        return 1
+    fi
+    
+    local count=1
+    while IFS='|' read -r id backup_path version_label created_at; do
+        local exists_status="${GREEN}✓${NC}"
+        [ ! -f "$backup_path" ] && exists_status="${RED}✗${NC}"
+        
+        echo -e "$count) [$exists_status] $version_label"
+        echo -e "   Created: $created_at"
+        echo -e "   Path: $backup_path"
+        ((count++))
+    done <<< "$backups"
+}
+
+# Launch a backup binary
+launch_backup_binary() {
+    local repo_id="$1"
+    
+    local backups
+    backups=$(get_binary_backups "$repo_id")
+    
+    if [ -z "$backups" ]; then
+        echo -e "${YELLOW}No backups found for this repository${NC}"
+        return 1
+    fi
+    
+    echo -e "\n${BLUE}Select a backup to launch:${NC}"
+    local -a backup_ids=()
+    local -a backup_paths=()
+    local count=1
+    
+    while IFS='|' read -r id backup_path version_label created_at; do
+        if [ -f "$backup_path" ]; then
+            echo "$count) $version_label ($created_at)"
+            backup_ids+=("$id")
+            backup_paths+=("$backup_path")
+            ((count++))
+        fi
+    done <<< "$backups"
+    
+    if [ ${#backup_paths[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No valid backup binaries found${NC}"
+        return 1
+    fi
+    
+    echo ""
+    read -rp "Select backup (1-$((count-1))): " selection
+    
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -lt "$count" ]; then
+        local idx=$((selection - 1))
+        local selected_binary="${backup_paths[$idx]}"
+        
+        echo "1) Quiet (background)"
+        echo "2) Verbose (show output)"
+        read -rp "Launch mode (1/2): " mode
+        
+        if [ "$mode" = "1" ]; then
+            nohup "$selected_binary" >/dev/null 2>&1 &
+            echo -e "${GREEN}Launched in background (PID: $!)${NC}"
+        else
+            echo -e "${BLUE}Running $selected_binary...${NC}"
+            "$selected_binary"
+        fi
+    else
+        echo -e "${RED}Invalid selection${NC}"
+        return 1
+    fi
+}
+
+# Restore a backup binary (replace current with backup)
+restore_backup_binary() {
+    local repo_id="$1"
+    
+    local backups
+    backups=$(get_binary_backups "$repo_id")
+    
+    if [ -z "$backups" ]; then
+        echo -e "${YELLOW}No backups found for this repository${NC}"
+        return 1
+    fi
+    
+    echo -e "\n${BLUE}Select a backup to restore:${NC}"
+    local -a backup_ids=()
+    local -a backup_paths=()
+    local -a original_paths=()
+    local count=1
+    
+    while IFS='|' read -r id backup_path version_label created_at; do
+        if [ -f "$backup_path" ]; then
+            echo "$count) $version_label ($created_at)"
+            backup_ids+=("$id")
+            backup_paths+=("$backup_path")
+            # Get original path
+            local orig_path
+            orig_path=$(sqlite3 "$DB_FILE" "SELECT original_path FROM binary_backups WHERE id = $id;")
+            original_paths+=("$orig_path")
+            ((count++))
+        fi
+    done <<< "$backups"
+    
+    if [ ${#backup_paths[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No valid backup binaries found${NC}"
+        return 1
+    fi
+    
+    echo ""
+    read -rp "Select backup to restore (1-$((count-1))): " selection
+    
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -lt "$count" ]; then
+        local idx=$((selection - 1))
+        local selected_backup="${backup_paths[$idx]}"
+        local original_path="${original_paths[$idx]}"
+        
+        echo -e "${YELLOW}This will replace: $original_path${NC}"
+        read -rp "Are you sure? (y/N): " confirm
+        
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            if cp "$selected_backup" "$original_path"; then
+                chmod +x "$original_path"
+                echo -e "${GREEN}Binary restored successfully${NC}"
+                return 0
+            else
+                echo -e "${RED}Failed to restore binary${NC}"
+                return 1
+            fi
+        fi
+    else
+        echo -e "${RED}Invalid selection${NC}"
+        return 1
+    fi
+}
+
+# Delete a binary backup
+delete_binary_backup() {
+    local repo_id="$1"
+    
+    local backups
+    backups=$(get_binary_backups "$repo_id")
+    
+    if [ -z "$backups" ]; then
+        echo -e "${YELLOW}No backups found for this repository${NC}"
+        return 1
+    fi
+    
+    echo -e "\n${BLUE}Select a backup to delete:${NC}"
+    local -a backup_ids=()
+    local -a backup_paths=()
+    local count=1
+    
+    while IFS='|' read -r id backup_path version_label created_at; do
+        echo "$count) $version_label ($created_at)"
+        backup_ids+=("$id")
+        backup_paths+=("$backup_path")
+        ((count++))
+    done <<< "$backups"
+    
+    echo ""
+    read -rp "Select backup to delete (1-$((count-1))): " selection
+    
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -lt "$count" ]; then
+        local idx=$((selection - 1))
+        local selected_id="${backup_ids[$idx]}"
+        local selected_path="${backup_paths[$idx]}"
+        
+        read -rp "Are you sure you want to delete this backup? (y/N): " confirm
+        
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            # Delete file
+            [ -f "$selected_path" ] && rm -f "$selected_path"
+            
+            # Delete from database
+            sqlite3 "$DB_FILE" "DELETE FROM binary_backups WHERE id = $selected_id;"
+            
+            echo -e "${GREEN}Backup deleted${NC}"
+            return 0
+        fi
+    else
+        echo -e "${RED}Invalid selection${NC}"
+        return 1
+    fi
+}
+
+# Binary backups menu
+binary_backups_menu() {
+    local repo_id="$1"
+    
+    if [ -z "$repo_id" ]; then
+        read -rp "Enter repository ID: " repo_id
+    fi
+    
+    if ! is_valid_id "$repo_id"; then
+        error "Invalid repository ID"
+        return 1
+    fi
+    
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id AND deleted = 0;")
+    
+    if [ -z "$repo_name" ]; then
+        error "Repository not found"
+        return 1
+    fi
+    
+    while true; do
+        show_standard_layout "Binary Backups - $repo_name"
+        
+        local backup_count
+        backup_count=$(count_binary_backups "$repo_id")
+        echo -e "Backups: ${GREEN}$backup_count${NC} / ${YELLOW}$BINARY_BACKUP_LIMIT${NC} (limit)"
+        echo ""
+        echo "1) List backups"
+        echo "2) Create backup now"
+        echo "3) Launch backup binary"
+        echo "4) Restore backup (replace current)"
+        echo "5) Delete backup"
+        
+        echo ""
+        local esc_status=0
+        read_with_esc "Select option: " choice "H" || esc_status=$?
+        
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc
+            72) show_help_page; continue ;;  # H - Help
+        esac
+        
+        case $choice in
+            1) list_binary_backups "$repo_id"; read -rp "Press Enter to continue..." ;;
+            2) 
+                read -rp "Enter version label (or Enter for auto): " label
+                backup_binary "$repo_id" "$label"
+                read -rp "Press Enter to continue..."
+                ;;
+            3) launch_backup_binary "$repo_id" ;;
+            4) restore_backup_binary "$repo_id" ;;
+            5) delete_binary_backup "$repo_id" ;;
+            *) echo -e "${RED}Invalid option${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+# DESKTOP LAUNCHER FUNCTIONS
+# =============================================================================
+
+# Available menu categories for .desktop files
+DESKTOP_CATEGORIES=("Development" "Game" "Graphics" "Network" "Office" "Science" "System" "Utility" "AudioVideo" "Education")
+
+# Create a desktop launcher for a repository binary
+create_desktop_launcher() {
+    local repo_id="$1"
+    
+    if ! is_valid_id "$repo_id"; then
+        error "Invalid repository ID"
+        return 1
+    fi
+    
+    # Get repository info
+    local repo_info
+    repo_info=$(sqlite3 "$DB_FILE" "SELECT name, binary_path FROM repositories WHERE id = $repo_id AND deleted = 0;")
+    
+    if [ -z "$repo_info" ]; then
+        error "Repository not found"
+        return 1
+    fi
+    
+    local repo_name binary_path
+    repo_name=$(echo "$repo_info" | cut -d'|' -f1)
+    binary_path=$(echo "$repo_info" | cut -d'|' -f2)
+    
+    if [ -z "$binary_path" ] || [ ! -x "$binary_path" ]; then
+        echo -e "${RED}No executable binary registered for this repository.${NC}"
+        echo -e "Please register a binary first (option 10 in build details)."
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    echo -e "\n${BLUE}Create Desktop Launcher for $repo_name${NC}"
+    
+    # Get launcher name
+    local launcher_name
+    read -rp "Launcher name [$repo_name]: " launcher_name
+    [ -z "$launcher_name" ] && launcher_name="$repo_name"
+    
+    # Get description
+    local description
+    read -rp "Description: " description
+    [ -z "$description" ] && description="$repo_name - Built with GitBuilder"
+    
+    # Select menu category
+    echo -e "\n${CYAN}Select menu category:${NC}"
+    local i=1
+    for cat in "${DESKTOP_CATEGORIES[@]}"; do
+        echo "$i) $cat"
+        ((i++))
+    done
+    
+    local cat_choice
+    read -rp "Select category (1-${#DESKTOP_CATEGORIES[@]}) [1]: " cat_choice
+    [ -z "$cat_choice" ] && cat_choice=1
+    
+    local category="${DESKTOP_CATEGORIES[0]}"
+    if [[ "$cat_choice" =~ ^[0-9]+$ ]] && [ "$cat_choice" -ge 1 ] && [ "$cat_choice" -le "${#DESKTOP_CATEGORIES[@]}" ]; then
+        category="${DESKTOP_CATEGORIES[$((cat_choice-1))]}"
+    fi
+    
+    # Select icon
+    local icon_path=""
+    echo -e "\n${CYAN}Select icon:${NC}"
+    echo "1) Browse for icon file"
+    echo "2) Use system icon name"
+    echo "3) No icon"
+    
+    local icon_choice
+    read -rp "Select option [1]: " icon_choice
+    [ -z "$icon_choice" ] && icon_choice=1
+    
+    case "$icon_choice" in
+        1)
+            # Browse for icon
+            echo -e "\n${BLUE}Browse for icon file...${NC}"
+            local src_dir="$SRC_DIR/$repo_name"
+            [ ! -d "$src_dir" ] && src_dir="$HOME"
+            
+            file_browser "$src_dir" "image" || true
+            if [ -f "/tmp/gitbuilder_selected_file" ]; then
+                icon_path=$(cat "/tmp/gitbuilder_selected_file")
+                rm -f "/tmp/gitbuilder_selected_file"
+            fi
+            ;;
+        2)
+            # System icon name
+            read -rp "Enter system icon name (e.g., 'utilities-terminal'): " icon_path
+            ;;
+        3|*)
+            # No icon
+            icon_path=""
+            ;;
+    esac
+    
+    # Generate desktop file
+    local desktop_filename
+    desktop_filename=$(echo "$launcher_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+    local desktop_file="$DESKTOP_LAUNCHERS_DIR/gitbuilder-${desktop_filename}.desktop"
+    
+    # Check if launcher already exists
+    if [ -f "$desktop_file" ]; then
+        echo -e "${YELLOW}Launcher already exists: $desktop_file${NC}"
+        read -rp "Overwrite? (y/N): " overwrite
+        if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Cancelled${NC}"
+            return 0
+        fi
+    fi
+    
+    # Create .desktop file
+    cat > "$desktop_file" << EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=$launcher_name
+Comment=$description
+Exec=$binary_path
+Icon=$icon_path
+Terminal=false
+Categories=$category;
+StartupNotify=true
+EOF
+    
+    chmod +x "$desktop_file"
+    
+    # Record in database
+    local escaped_desktop_path escaped_icon_path escaped_category
+    escaped_desktop_path=$(sql_escape "$desktop_file")
+    escaped_icon_path=$(sql_escape "$icon_path")
+    escaped_category=$(sql_escape "$category")
+    
+    # Check if entry exists
+    local existing
+    existing=$(sqlite3 "$DB_FILE" "SELECT id FROM desktop_launchers WHERE repo_id = $repo_id;")
+    
+    if [ -n "$existing" ]; then
+        sqlite3 "$DB_FILE" "UPDATE desktop_launchers SET desktop_file_path = '$escaped_desktop_path', icon_path = '$escaped_icon_path', menu_category = '$escaped_category' WHERE repo_id = $repo_id;"
+    else
+        sqlite3 "$DB_FILE" "INSERT INTO desktop_launchers (repo_id, desktop_file_path, icon_path, menu_category) VALUES ($repo_id, '$escaped_desktop_path', '$escaped_icon_path', '$escaped_category');"
+    fi
+    
+    echo -e "\n${GREEN}Desktop launcher created: $desktop_file${NC}"
+    echo -e "${CYAN}The launcher should appear in your application menu under '$category'.${NC}"
+    echo -e "${YELLOW}Note: You may need to log out and back in for the launcher to appear.${NC}"
+    
+    read -rp "Press Enter to continue..."
+}
+
+# Delete a desktop launcher
+delete_desktop_launcher() {
+    local repo_id="$1"
+    
+    local launcher_info
+    launcher_info=$(sqlite3 "$DB_FILE" "SELECT desktop_file_path FROM desktop_launchers WHERE repo_id = $repo_id;")
+    
+    if [ -z "$launcher_info" ]; then
+        echo -e "${YELLOW}No desktop launcher found for this repository${NC}"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}This will delete: $launcher_info${NC}"
+    read -rp "Are you sure? (y/N): " confirm
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        [ -f "$launcher_info" ] && rm -f "$launcher_info"
+        sqlite3 "$DB_FILE" "DELETE FROM desktop_launchers WHERE repo_id = $repo_id;"
+        echo -e "${GREEN}Desktop launcher deleted${NC}"
+    fi
+}
+
+# =============================================================================
 # BUILD PROFILES FUNCTIONS
 # =============================================================================
 
@@ -4092,11 +4854,16 @@ build_profiles_menu() {
         echo "5) Save repository config as profile"
         
         echo ""
-        read_with_esc "Select option: " choice
-        [ $? -eq 27 ] && return 0
+        local esc_status=0
+        read_with_esc "Select option: " choice "H" || esc_status=$?
+        
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc
+            72) show_help_page; continue ;;  # H - Help
+        esac
         
         case $choice in
-            [Hh]) show_help_page; continue ;;
             1) list_build_profiles; read -rp "Press Enter to continue..." ;;
             2) create_build_profile ;;
             3) 
@@ -4267,11 +5034,16 @@ build_queue_menu() {
         echo "5) Clear all"
         
         echo ""
-        read_with_esc "Select option: " choice
-        [ $? -eq 27 ] && return 0
+        local esc_status=0
+        read_with_esc "Select option: " choice "H" || esc_status=$?
+        
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc
+            72) show_help_page; continue ;;  # H - Help
+        esac
         
         case $choice in
-            [Hh]) show_help_page; continue ;;
             1) 
                 read -rp "Enter repository ID: " rid
                 add_to_queue "$rid"
@@ -4383,11 +5155,16 @@ build_history_menu() {
         echo "4) Clear old history"
         
         echo ""
-        read_with_esc "Select option: " choice
-        [ $? -eq 27 ] && return 0
+        local esc_status=0
+        read_with_esc "Select option: " choice "H" || esc_status=$?
+        
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc
+            72) show_help_page; continue ;;  # H - Help
+        esac
         
         case $choice in
-            [Hh]) show_help_page; continue ;;
             1) 
                 show_build_history
                 read -rp "Press Enter to continue..."
@@ -4534,11 +5311,16 @@ dependencies_menu() {
         echo "4) Build with dependencies"
         
         echo ""
-        read_with_esc "Select option: " choice
-        [ $? -eq 27 ] && return 0
+        local esc_status=0
+        read_with_esc "Select option: " choice "H" || esc_status=$?
+        
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc
+            72) show_help_page; continue ;;  # H - Help
+        esac
         
         case $choice in
-            [Hh]) show_help_page; continue ;;
             1)
                 read -rp "Enter repository ID: " rid
                 show_repo_dependencies "$rid"
@@ -4692,11 +5474,16 @@ theme_menu() {
         echo "4) Mono (no colors)"
         
         echo ""
-        read_with_esc "Select theme: " choice
-        [ $? -eq 27 ] && return 0
+        local esc_status=0
+        read_with_esc "Select theme: " choice "H" || esc_status=$?
+        
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc
+            72) show_help_page; continue ;;  # H - Help
+        esac
         
         case $choice in
-            [Hh]) show_help_page; continue ;;
             1) THEME="default" ;;
             2) THEME="ocean" ;;
             3) THEME="forest" ;;
@@ -4726,11 +5513,16 @@ settings_menu() {
         echo "6) Restore database"
         
         echo ""
-        read_with_esc "Select option: " choice
-        [ $? -eq 27 ] && return 0
+        local esc_status=0
+        read_with_esc "Select option: " choice "H" || esc_status=$?
+        
+        # Handle hotkeys
+        case $esc_status in
+            27) return 0 ;;  # Esc
+            72) show_help_page; continue ;;  # H - Help
+        esac
         
         case $choice in
-            [Hh]) show_help_page; continue ;;
             1) theme_menu ;;
             2)
                 if [ "${NOTIFICATIONS_ENABLED:-true}" = "true" ]; then
