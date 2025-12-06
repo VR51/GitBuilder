@@ -24,7 +24,7 @@ MAKE_FLAGS=""
 CMAKE_FLAGS=""
 
 # Path to the compiled binary (relative to repo root or absolute)
-BINARY_PATH="/home/lee/.local/share/gitbuilder/src/Atari800/src/atari800"
+BINARY_PATH="~/.local/share/gitbuilder/src/Atari800/src/atari800"
 
 # Repository notes (displayed after build)
 NOTES="Keyboard, joystick and other controllers
