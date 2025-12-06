@@ -3,9 +3,9 @@
 # GitBuilder - GitHub repository management and build automation tool
 # Author: Cascade
 # Prompt Engineer: VR51
-# Version: 1.0.2
+# Version: 2.0.0
 # Created: 2025-04-11
-# Updated: 2025-04-15
+# Updated: 2025-12-05
 # License: GNU General Public License v3.0
 # Donate: https://paypal.me/vr51/
 #
@@ -24,7 +24,67 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 set -euo pipefail
+set -o noclobber  # Prevent accidental file overwrites
 IFS=$'\n\t'
+
+# =============================================================================
+# VERSION AND HELP
+# =============================================================================
+VERSION="2.0.0"
+GITHUB_REPO="https://github.com/vr51/GitBuilder"
+
+show_help() {
+    cat << EOF
+GitBuilder v${VERSION} - GitHub repository management and build automation tool
+
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  -h, --help      Show this help message and exit
+  -v, --version   Show version information
+  -l, --list      List all repositories and exit
+  -b, --build ID  Build repository with given ID
+  -u, --update    Update all repository commit dates
+  --backup FILE   Backup database to FILE
+  --restore FILE  Restore database from FILE
+  --check-update  Check for GitBuilder updates
+
+Examples:
+  $(basename "$0")              # Start interactive mode
+  $(basename "$0") -l           # List repositories
+  $(basename "$0") -b 1         # Build repository ID 1
+  $(basename "$0") --backup ~/backup.sql
+
+Environment Variables:
+  GITBUILDER_JOBS   Number of parallel build jobs (default: auto-detect)
+  EDITOR            Preferred text editor for notes
+
+For more information, see: $GITHUB_REPO
+EOF
+}
+
+show_version() {
+    echo "GitBuilder v${VERSION}"
+    echo "Copyright (C) 2025 VR51"
+    echo "License: GNU GPL v3.0"
+}
+
+# Parse command line arguments early (before any initialization)
+parse_early_args() {
+    case "${1:-}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--version)
+            show_version
+            exit 0
+            ;;
+    esac
+}
+
+# Check for help/version before anything else
+parse_early_args "$@"
 
 # Required commands and their corresponding packages
 declare -A REQUIRED_PACKAGES=(
@@ -35,6 +95,7 @@ declare -A REQUIRED_PACKAGES=(
     [make]="make"
     [cmake]="cmake"
     [file]="file"
+    [ccache]="ccache"
 )
 
 # Configuration
@@ -43,15 +104,276 @@ DB_FILE="$DB_DIR/repos.db"
 SRC_DIR="$HOME/.local/share/gitbuilder/src"
 GITHUB_API="https://api.github.com"
 
-# Ensure directories exist
-mkdir -p "$DB_DIR" "$SRC_DIR"
+# Build optimization: detect CPU cores for parallel builds
+# Use all cores by default, can be overridden by setting GITBUILDER_JOBS
+CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+# Ensure we have a valid number, default to 4 if detection fails
+[[ ! "$CPU_CORES" =~ ^[0-9]+$ ]] && CPU_CORES=4
+PARALLEL_JOBS="${GITBUILDER_JOBS:-$CPU_CORES}"
+[[ ! "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] && PARALLEL_JOBS=4
 
-# ANSI color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# RAM disk configuration
+RAMDISK_DIR="$HOME/.local/share/gitbuilder/ramdisk"
+RAMDISK_MOUNT_POINT="$RAMDISK_DIR/build"
+RAMDISK_MIN_FREE_MB=2048  # Minimum free RAM required (2GB)
+RAMDISK_ACTIVE=false
+
+# Gitbuildfiles directory (relative to script location)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GITBUILDFILES_DIR="$SCRIPT_DIR/gitbuildfiles"
+
+# Additional directories
+BUILD_HISTORY_DIR="$DB_DIR/history"
+BUILD_PROFILES_DIR="$DB_DIR/profiles"
+PLUGINS_DIR="$SCRIPT_DIR/plugins"
+CONFIG_FILE="$DB_DIR/config"
+BACKUP_DIR="$DB_DIR/backups"
+
+# Ensure directories exist
+mkdir -p "$DB_DIR" "$SRC_DIR" "$GITBUILDFILES_DIR" "$BUILD_HISTORY_DIR" "$BUILD_PROFILES_DIR" "$PLUGINS_DIR" "$BACKUP_DIR"
+
+# Set secure permissions on database directory
+chmod 700 "$DB_DIR" 2>/dev/null || true
+
+# =============================================================================
+# THEME SYSTEM
+# =============================================================================
+
+# Default theme (can be overridden in config file)
+THEME="default"
+
+# Theme definitions
+declare -A THEME_DEFAULT=(
+    [RED]='\033[0;31m'
+    [GREEN]='\033[0;32m'
+    [YELLOW]='\033[1;33m'
+    [BLUE]='\033[0;34m'
+    [CYAN]='\033[0;36m'
+    [MAGENTA]='\033[0;35m'
+    [WHITE]='\033[1;37m'
+    [GRAY]='\033[0;90m'
+    [NC]='\033[0m'
+)
+
+declare -A THEME_OCEAN=(
+    [RED]='\033[38;5;203m'
+    [GREEN]='\033[38;5;114m'
+    [YELLOW]='\033[38;5;221m'
+    [BLUE]='\033[38;5;39m'
+    [CYAN]='\033[38;5;87m'
+    [MAGENTA]='\033[38;5;141m'
+    [WHITE]='\033[38;5;255m'
+    [GRAY]='\033[38;5;245m'
+    [NC]='\033[0m'
+)
+
+declare -A THEME_FOREST=(
+    [RED]='\033[38;5;167m'
+    [GREEN]='\033[38;5;71m'
+    [YELLOW]='\033[38;5;179m'
+    [BLUE]='\033[38;5;67m'
+    [CYAN]='\033[38;5;73m'
+    [MAGENTA]='\033[38;5;139m'
+    [WHITE]='\033[38;5;253m'
+    [GRAY]='\033[38;5;243m'
+    [NC]='\033[0m'
+)
+
+declare -A THEME_MONO=(
+    [RED]='\033[1;37m'
+    [GREEN]='\033[1;37m'
+    [YELLOW]='\033[1;37m'
+    [BLUE]='\033[0;37m'
+    [CYAN]='\033[0;37m'
+    [MAGENTA]='\033[0;37m'
+    [WHITE]='\033[1;37m'
+    [GRAY]='\033[0;90m'
+    [NC]='\033[0m'
+)
+
+# Apply theme
+apply_theme() {
+    local theme_name="${1:-default}"
+    local -n theme_ref
+    
+    case "$theme_name" in
+        ocean) theme_ref=THEME_OCEAN ;;
+        forest) theme_ref=THEME_FOREST ;;
+        mono) theme_ref=THEME_MONO ;;
+        *) theme_ref=THEME_DEFAULT ;;
+    esac
+    
+    RED="${theme_ref[RED]}"
+    GREEN="${theme_ref[GREEN]}"
+    YELLOW="${theme_ref[YELLOW]}"
+    BLUE="${theme_ref[BLUE]}"
+    CYAN="${theme_ref[CYAN]}"
+    MAGENTA="${theme_ref[MAGENTA]:-\033[0;35m}"
+    WHITE="${theme_ref[WHITE]:-\033[1;37m}"
+    GRAY="${theme_ref[GRAY]:-\033[0;90m}"
+    NC="${theme_ref[NC]}"
+}
+
+# Load configuration file
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+    apply_theme "$THEME"
+}
+
+# Save configuration
+save_config() {
+    cat > "$CONFIG_FILE" << EOF
+# GitBuilder Configuration File
+# Generated: $(date -Iseconds)
+
+# Theme: default, ocean, forest, mono
+THEME="$THEME"
+
+# Auto-update check interval (days, 0 to disable)
+AUTO_UPDATE_CHECK_DAYS="${AUTO_UPDATE_CHECK_DAYS:-7}"
+
+# Desktop notifications (true/false)
+NOTIFICATIONS_ENABLED="${NOTIFICATIONS_ENABLED:-true}"
+
+# Default build profile
+DEFAULT_PROFILE="${DEFAULT_PROFILE:-}"
+
+# Build queue auto-start (true/false)
+BUILD_QUEUE_AUTOSTART="${BUILD_QUEUE_AUTOSTART:-false}"
+
+# Preferred text editor for notes
+PREFERRED_EDITOR="${PREFERRED_EDITOR:-}"
+EOF
+    chmod 600 "$CONFIG_FILE"
+}
+
+# Get preferred editor
+get_editor() {
+    # Check if user has set a preferred editor
+    if [ -n "${PREFERRED_EDITOR:-}" ] && command -v "$PREFERRED_EDITOR" >/dev/null 2>&1; then
+        echo "$PREFERRED_EDITOR"
+        return 0
+    fi
+    
+    # Check common editors in order of preference
+    local editors=("nano" "vim" "vi" "emacs" "gedit" "kate" "code" "subl")
+    for editor in "${editors[@]}"; do
+        if command -v "$editor" >/dev/null 2>&1; then
+            echo "$editor"
+            return 0
+        fi
+    done
+    
+    # No editor found
+    echo ""
+}
+
+# List installed editors
+list_installed_editors() {
+    local editors=("nano" "vim" "vi" "emacs" "micro" "ne" "joe" "gedit" "kate" "xed" "pluma" "mousepad" "code" "subl" "atom")
+    local installed=()
+    
+    for editor in "${editors[@]}"; do
+        if command -v "$editor" >/dev/null 2>&1; then
+            installed+=("$editor")
+        fi
+    done
+    
+    echo "${installed[@]}"
+}
+
+# Change editor preference
+change_editor() {
+    local current_editor
+    current_editor=$(get_editor)
+    
+    echo -e "\n${BLUE}Text Editor Settings${NC}"
+    echo "============================================"
+    echo -e "Current editor: ${GREEN}${current_editor:-none}${NC}"
+    echo -e "Preferred editor: ${CYAN}${PREFERRED_EDITOR:-auto-detect}${NC}"
+    echo ""
+    
+    # List installed editors
+    echo -e "${YELLOW}Installed editors:${NC}"
+    local installed
+    installed=$(list_installed_editors)
+    
+    if [ -z "$installed" ]; then
+        echo -e "${RED}No text editors found!${NC}"
+    else
+        local i=1
+        for editor in $installed; do
+            if [ "$editor" = "$current_editor" ]; then
+                echo -e "  $i) ${GREEN}$editor${NC} (current)"
+            else
+                echo "  $i) $editor"
+            fi
+            ((i++))
+        done
+    fi
+    
+    echo ""
+    echo "============================================"
+    echo ""
+    echo "Options:"
+    echo "  Enter editor name to set as preferred"
+    echo "  Enter 'auto' to use auto-detection"
+    echo "  Enter 'install' to install nano"
+    echo "  Press Enter to cancel"
+    echo ""
+    
+    read -rp "Choice: " choice
+    
+    case "$choice" in
+        "")
+            echo -e "${YELLOW}Cancelled${NC}"
+            ;;
+        auto)
+            PREFERRED_EDITOR=""
+            save_config
+            success "Editor set to auto-detect"
+            ;;
+        install)
+            if install_packages nano; then
+                if command -v nano >/dev/null 2>&1; then
+                    PREFERRED_EDITOR="nano"
+                    save_config
+                    success "nano installed and set as preferred editor"
+                else
+                    error "Failed to install nano"
+                fi
+            fi
+            ;;
+        *)
+            if command -v "$choice" >/dev/null 2>&1; then
+                PREFERRED_EDITOR="$choice"
+                save_config
+                success "Preferred editor set to: $choice"
+            else
+                error "Editor '$choice' not found. Please install it first."
+            fi
+            ;;
+    esac
+    
+    read -rp "Press Enter to continue..."
+}
+
+# Initialize config with defaults if not exists
+[ ! -f "$CONFIG_FILE" ] && save_config
+
+# Load configuration
+load_config
+
+# ANSI color codes (set by theme, these are fallback defaults)
+RED="${RED:-\033[0;31m}"
+GREEN="${GREEN:-\033[0;32m}"
+YELLOW="${YELLOW:-\033[1;33m}"
+BLUE="${BLUE:-\033[0;34m}"
+CYAN="${CYAN:-\033[0;36m}"
+NC="${NC:-\033[0m}"
 
 # Check for required commands and offer to install missing ones
 check_requirements() {
@@ -72,15 +394,7 @@ check_requirements() {
         read -rp "Would you like to install them now? (y/N): " choice
         
         if [[ $choice =~ ^[Yy]$ ]]; then
-            if command -v apt-get >/dev/null 2>&1; then
-                sudo apt-get update && sudo apt-get install -y "${missing_pkgs[@]}"
-            elif command -v dnf >/dev/null 2>&1; then
-                sudo dnf install -y "${missing_pkgs[@]}"
-            elif command -v pacman >/dev/null 2>&1; then
-                sudo pacman -S --noconfirm "${missing_pkgs[@]}"
-            else
-                error "Unsupported package manager. Please install required packages manually."
-            fi
+            install_packages "${missing_pkgs[@]}"
         else
             error "Required packages must be installed to continue."
         fi
@@ -124,17 +438,11 @@ check_build_dependencies() {
         read -rp "Would you like to install them now? (y/N): " choice
         
         if [[ $choice =~ ^[Yy]$ ]]; then
-            if command -v apt-get >/dev/null 2>&1; then
-                sudo apt-get update && sudo apt-get install -y "${missing_deps[@]}"
-            elif command -v dnf >/dev/null 2>&1; then
-                sudo dnf install -y "${missing_deps[@]}"
-            elif command -v pacman >/dev/null 2>&1; then
-                sudo pacman -S --noconfirm "${missing_deps[@]}"
+            if install_packages "${missing_deps[@]}"; then
+                echo -e "${GREEN}Dependencies installed successfully${NC}"
             else
-                error "Unsupported package manager. Please install required packages manually."
                 return 1
             fi
-            echo -e "${GREEN}Dependencies installed successfully${NC}"
         else
             echo -e "${YELLOW}Warning: Missing dependencies may cause build to fail${NC}"
             read -rp "Continue anyway? (y/N): " continue_choice
@@ -180,7 +488,59 @@ CREATE TABLE IF NOT EXISTS build_configs (
     make_flags TEXT,
     cmake_flags TEXT,
     dependencies TEXT,
+    strip_debug INTEGER DEFAULT 0,
+    use_ramdisk INTEGER DEFAULT 0,
     FOREIGN KEY(repo_id) REFERENCES repositories(id)
+);
+
+CREATE TABLE IF NOT EXISTS repository_notes (
+    repo_id INTEGER PRIMARY KEY,
+    notes TEXT,
+    FOREIGN KEY(repo_id) REFERENCES repositories(id)
+);
+
+CREATE TABLE IF NOT EXISTS build_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER,
+    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    finished_at TEXT,
+    success INTEGER,
+    duration_seconds INTEGER,
+    log_file TEXT,
+    build_profile TEXT,
+    FOREIGN KEY(repo_id) REFERENCES repositories(id)
+);
+
+CREATE TABLE IF NOT EXISTS build_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    description TEXT,
+    configure_flags TEXT,
+    make_flags TEXT,
+    cmake_flags TEXT,
+    strip_debug INTEGER DEFAULT 0,
+    use_ramdisk INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS build_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER,
+    profile_id INTEGER,
+    priority INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',
+    added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    FOREIGN KEY(repo_id) REFERENCES repositories(id),
+    FOREIGN KEY(profile_id) REFERENCES build_profiles(id)
+);
+
+CREATE TABLE IF NOT EXISTS repo_dependencies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER,
+    depends_on_repo_id INTEGER,
+    FOREIGN KEY(repo_id) REFERENCES repositories(id),
+    FOREIGN KEY(depends_on_repo_id) REFERENCES repositories(id)
 );
 EOF
     
@@ -196,6 +556,12 @@ EOF
         
     sqlite3 "$DB_FILE" "PRAGMA table_info(build_configs);" | grep -q "dependencies" || \
         sqlite3 "$DB_FILE" "ALTER TABLE build_configs ADD COLUMN dependencies TEXT;"
+    
+    sqlite3 "$DB_FILE" "PRAGMA table_info(build_configs);" | grep -q "strip_debug" || \
+        sqlite3 "$DB_FILE" "ALTER TABLE build_configs ADD COLUMN strip_debug INTEGER DEFAULT 0;"
+    
+    sqlite3 "$DB_FILE" "PRAGMA table_info(build_configs);" | grep -q "use_ramdisk" || \
+        sqlite3 "$DB_FILE" "ALTER TABLE build_configs ADD COLUMN use_ramdisk INTEGER DEFAULT 0;"
 }
 
 # Handle errors gracefully
@@ -223,6 +589,9 @@ trap_error() {
     return 1
 }
 
+# Cleanup trap for RAM disk on exit
+trap 'cleanup_ramdisk 2>/dev/null' EXIT
+
 # Display success message
 success() {
     echo -e "\n${GREEN}Success: $1${NC}"
@@ -231,6 +600,482 @@ success() {
         read -r -n 1
     fi
 }
+
+# =============================================================================
+# SECURITY HELPER FUNCTIONS
+# =============================================================================
+
+# Escape string for safe SQL insertion (prevents SQL injection)
+sql_escape() {
+    local input="$1"
+    # Escape single quotes by doubling them
+    echo "${input//\'/\'\'}"
+}
+
+# Validate that input is a positive integer (for IDs)
+is_valid_id() {
+    local input="$1"
+    [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -gt 0 ]
+}
+
+# Sanitize path to prevent directory traversal
+sanitize_path() {
+    local path="$1"
+    # Remove any .. sequences and normalize
+    realpath -m "$path" 2>/dev/null || echo "$path"
+}
+
+# =============================================================================
+# SYSTEM HELPER FUNCTIONS
+# =============================================================================
+
+# Install packages using the system package manager
+# Usage: install_packages package1 package2 ...
+# Returns: 0 on success, 1 on failure
+install_packages() {
+    local packages=("$@")
+    
+    if [ ${#packages[@]} -eq 0 ]; then
+        return 0
+    fi
+    
+    echo -e "${BLUE}Installing packages: ${packages[*]}${NC}"
+    
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y "${packages[@]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y "${packages[@]}"
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm "${packages[@]}"
+    elif command -v zypper >/dev/null 2>&1; then
+        sudo zypper install -y "${packages[@]}"
+    else
+        error "Could not detect package manager. Please install packages manually: ${packages[*]}"
+        return 1
+    fi
+}
+
+# Format a date string consistently
+# Usage: format_date "date_string" [format]
+# format: "short" = YYYY-MM-DD, "long" = YYYY-MM-DD HH:MM (default)
+format_date() {
+    local date_str="$1"
+    local format="${2:-long}"
+    
+    if [ -z "$date_str" ] || [ "$date_str" = "Unknown" ]; then
+        echo "${date_str:-Unknown}"
+        return
+    fi
+    
+    local fmt_string
+    if [ "$format" = "short" ]; then
+        fmt_string="+%Y-%m-%d"
+    else
+        fmt_string="+%Y-%m-%d %H:%M"
+    fi
+    
+    date -d "$date_str" "$fmt_string" 2>/dev/null || echo "$date_str"
+}
+
+# Execute multiple SQL statements in a transaction
+# Usage: db_transaction "SQL statement 1; SQL statement 2; ..."
+# Returns: 0 on success, 1 on failure (transaction rolled back)
+db_transaction() {
+    local sql="$1"
+    sqlite3 "$DB_FILE" "BEGIN TRANSACTION; $sql COMMIT;" 2>/dev/null
+    local status=$?
+    if [ $status -ne 0 ]; then
+        sqlite3 "$DB_FILE" "ROLLBACK;" 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# RAM DISK FUNCTIONS
+# =============================================================================
+
+# Get available RAM in MB
+get_available_ram_mb() {
+    local available_kb
+    available_kb=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}')
+    if [ -z "$available_kb" ]; then
+        # Fallback for systems without MemAvailable
+        available_kb=$(free | awk '/^Mem:/{print $7}')
+    fi
+    echo $((available_kb / 1024))
+}
+
+# Check if RAM disk can be used
+can_use_ramdisk() {
+    local required_mb="${1:-$RAMDISK_MIN_FREE_MB}"
+    local available_mb
+    available_mb=$(get_available_ram_mb)
+    
+    if [ "$available_mb" -ge "$required_mb" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Setup RAM disk for building
+setup_ramdisk() {
+    local size_mb="${1:-1024}"
+    
+    # Check if already mounted
+    if mountpoint -q "$RAMDISK_MOUNT_POINT" 2>/dev/null; then
+        echo -e "${YELLOW}RAM disk already mounted at $RAMDISK_MOUNT_POINT${NC}"
+        RAMDISK_ACTIVE=true
+        return 0
+    fi
+    
+    # Create mount point directory
+    mkdir -p "$RAMDISK_MOUNT_POINT"
+    
+    # Mount tmpfs (doesn't require root if user has permissions, otherwise use sudo)
+    if mount -t tmpfs -o size=${size_mb}M,mode=0755 tmpfs "$RAMDISK_MOUNT_POINT" 2>/dev/null; then
+        echo -e "${GREEN}RAM disk mounted at $RAMDISK_MOUNT_POINT (${size_mb}MB)${NC}"
+        RAMDISK_ACTIVE=true
+        return 0
+    else
+        # Explain why sudo is needed
+        echo -e "${YELLOW}Mounting RAM disk requires elevated privileges.${NC}"
+        echo -e "${CYAN}Sudo is needed to create a temporary filesystem in RAM for faster builds.${NC}"
+        echo -e "${CYAN}This is safe and the RAM disk will be automatically unmounted after the build.${NC}"
+        if sudo mount -t tmpfs -o size=${size_mb}M,mode=0755,uid=$(id -u),gid=$(id -g) tmpfs "$RAMDISK_MOUNT_POINT"; then
+            echo -e "${GREEN}RAM disk mounted at $RAMDISK_MOUNT_POINT (${size_mb}MB)${NC}"
+            RAMDISK_ACTIVE=true
+            return 0
+        else
+            echo -e "${RED}Failed to mount RAM disk. Building on regular disk.${NC}"
+            RAMDISK_ACTIVE=false
+            return 1
+        fi
+    fi
+}
+
+# Cleanup RAM disk after building
+cleanup_ramdisk() {
+    if [ "$RAMDISK_ACTIVE" = true ] && mountpoint -q "$RAMDISK_MOUNT_POINT" 2>/dev/null; then
+        # Sync any pending writes
+        sync
+        
+        # Unmount - try without sudo first
+        if umount "$RAMDISK_MOUNT_POINT" 2>/dev/null; then
+            echo -e "${GREEN}RAM disk unmounted successfully${NC}"
+            RAMDISK_ACTIVE=false
+            return 0
+        else
+            echo -e "${YELLOW}Unmounting RAM disk requires elevated privileges.${NC}"
+            echo -e "${CYAN}Sudo is needed to safely release the temporary RAM filesystem.${NC}"
+            if sudo umount "$RAMDISK_MOUNT_POINT" 2>/dev/null; then
+                echo -e "${GREEN}RAM disk unmounted successfully${NC}"
+                RAMDISK_ACTIVE=false
+                return 0
+            else
+                echo -e "${YELLOW}Warning: Could not unmount RAM disk. It will be cleaned up on reboot.${NC}"
+                return 1
+            fi
+        fi
+    fi
+    return 0
+}
+
+# Offer RAM disk option to user
+offer_ramdisk() {
+    local repo_id="$1"
+    local available_mb
+    available_mb=$(get_available_ram_mb)
+    
+    if can_use_ramdisk; then
+        echo -e "\n${CYAN}RAM Disk Available${NC}"
+        echo -e "Available RAM: ${GREEN}${available_mb}MB${NC} (minimum required: ${RAMDISK_MIN_FREE_MB}MB)"
+        echo -e "Building on RAM disk can significantly speed up compilation."
+        echo ""
+        read -rp "Use RAM disk for this build? (y/N): " use_ram
+        if [[ "$use_ram" =~ ^[Yy]$ ]]; then
+            # Calculate size: use half of available RAM, max 4GB
+            local size_mb=$((available_mb / 2))
+            [ "$size_mb" -gt 4096 ] && size_mb=4096
+            [ "$size_mb" -lt 512 ] && size_mb=512
+            
+            if setup_ramdisk "$size_mb"; then
+                return 0
+            fi
+        fi
+    else
+        echo -e "${YELLOW}Note: Insufficient RAM for RAM disk build (${available_mb}MB available, ${RAMDISK_MIN_FREE_MB}MB required)${NC}"
+    fi
+    return 1
+}
+
+# =============================================================================
+# UNIFIED TABLE SYSTEM
+# =============================================================================
+# Global arrays for table data - populated by fetch_repo_data()
+declare -a _TABLE_HEADERS=()
+declare -a _TABLE_COL_DATA=()  # Flat array: col0_row0, col0_row1, ..., col1_row0, col1_row1, ...
+declare -g _TABLE_NUM_COLS=0
+declare -g _TABLE_NUM_ROWS=0
+
+# Fetch repository data from database and populate table arrays
+# Arguments:
+#   $1 - date_format: "full" (YYYY-MM-DD HH:MM) or "short" (MM-DD)
+fetch_repo_data() {
+    local date_format="${1:-full}"
+    
+    # Reset global arrays
+    _TABLE_HEADERS=("ID" "Name" "URL" "Last Commit" "Last Built" "Binary")
+    _TABLE_COL_DATA=()
+    _TABLE_NUM_COLS=6
+    _TABLE_NUM_ROWS=0
+    
+    # Temporary arrays for each column
+    local -a tmp_id=() tmp_name=() tmp_url=() tmp_commit=() tmp_built=() tmp_binary=()
+    
+    while IFS='|' read -r id name url last_commit last_built binary_path; do
+        tmp_id+=("$id")
+        tmp_name+=("$name")
+        tmp_url+=("$url")
+        
+        # Format the last commit date (always include year)
+        local formatted_commit=""
+        if [ -n "$last_commit" ] && [ "$last_commit" != "Unknown" ]; then
+            if [ "$date_format" = "short" ]; then
+                formatted_commit=$(date -d "$last_commit" "+%Y-%m-%d" 2>/dev/null || echo "${last_commit:0:10}")
+            else
+                formatted_commit=$(date -d "$last_commit" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_commit")
+            fi
+        else
+            formatted_commit="${last_commit:-Unknown}"
+        fi
+        tmp_commit+=("$formatted_commit")
+        
+        # Format the last built date (always include year)
+        local formatted_built=""
+        if [ -n "$last_built" ]; then
+            if [ "$date_format" = "short" ]; then
+                formatted_built=$(date -d "$last_built" "+%Y-%m-%d" 2>/dev/null || echo "${last_built:0:10}")
+            else
+                formatted_built=$(date -d "$last_built" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_built")
+            fi
+        else
+            formatted_built="Never"
+        fi
+        tmp_built+=("$formatted_built")
+        
+        # Binary status
+        local binary_status="No"
+        if [ -n "$binary_path" ] && [ -x "$binary_path" ]; then
+            binary_status="Yes"
+        fi
+        tmp_binary+=("$binary_status")
+        
+        ((_TABLE_NUM_ROWS++)) || true
+    done < <(sqlite3 "$DB_FILE" "SELECT id, name, url, last_commit, last_built, binary_path FROM repositories WHERE deleted = 0 ORDER BY id;")
+    
+    # Flatten into _TABLE_COL_DATA: all of col0, then all of col1, etc.
+    # This allows easy access: _TABLE_COL_DATA[col * num_rows + row]
+    local i
+    for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_id[i]}"); done
+    for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_name[i]}"); done
+    for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_url[i]}"); done
+    for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_commit[i]}"); done
+    for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_built[i]}"); done
+    for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_binary[i]}"); done
+}
+
+# Get cell value from table data
+# Arguments: $1=column_index, $2=row_index
+_table_get_cell() {
+    local col="$1" row="$2"
+    local idx=$(( col * _TABLE_NUM_ROWS + row ))
+    echo "${_TABLE_COL_DATA[$idx]}"
+}
+
+# Render table with dynamic column widths
+# Arguments:
+#   $1 - title (optional, e.g., "Available Repositories:")
+#   $2 - min_widths (optional, pipe-separated, e.g., "2|8|10|10|10|3")
+# Uses global _TABLE_HEADERS, _TABLE_COL_DATA, _TABLE_NUM_COLS, _TABLE_NUM_ROWS
+render_table() {
+    local title="${1:-}"
+    local min_widths_str="${2:-}"
+    
+    if [ "$_TABLE_NUM_ROWS" -eq 0 ]; then
+        [ -n "$title" ] && echo -e "${BLUE}${title}${NC}"
+        echo -e "${BLUE}No data to display${NC}"
+        return
+    fi
+    
+    # Get terminal width
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo 80)
+    
+    # Parse minimum widths
+    local -a min_widths=()
+    if [ -n "$min_widths_str" ]; then
+        IFS='|' read -ra min_widths <<< "$min_widths_str"
+    fi
+    
+    # Calculate optimal width for each column
+    local -a col_widths=()
+    local col row len max_len
+    
+    for ((col=0; col<_TABLE_NUM_COLS; col++)); do
+        # Start with header width
+        max_len=${#_TABLE_HEADERS[col]}
+        
+        # Check all data in this column
+        for ((row=0; row<_TABLE_NUM_ROWS; row++)); do
+            local cell_val
+            cell_val=$(_table_get_cell "$col" "$row")
+            len=${#cell_val}
+            [ "$len" -gt "$max_len" ] && max_len=$len
+        done
+        
+        # Apply minimum width if specified
+        local min_w=2
+        if [ "${min_widths[$col]+isset}" ]; then
+            min_w=${min_widths[$col]}
+        fi
+        [ "$max_len" -lt "$min_w" ] && max_len=$min_w
+        
+        col_widths+=("$max_len")
+    done
+    
+    # Calculate total table width: │ col │ col │ ... │
+    # Each column: 1 (border) + 1 (space) + width + 1 (space) = width + 3
+    # Plus final border: +1
+    local total_width=1
+    for ((col=0; col<_TABLE_NUM_COLS; col++)); do
+        total_width=$((total_width + col_widths[col] + 3))
+    done
+    
+    # Shrink columns if table exceeds terminal width
+    if [ "$total_width" -gt "$term_width" ]; then
+        local excess=$((total_width - term_width))
+        
+        # Priority order for shrinking: URL (2), Name (1), Commit (3), Built (4)
+        local -a shrink_order=(2 1 3 4)
+        local -a shrink_mins=(10 8 10 10)
+        
+        for idx in "${!shrink_order[@]}"; do
+            [ "$excess" -le 0 ] && break
+            local col_idx=${shrink_order[$idx]}
+            local min_w=${shrink_mins[$idx]}
+            
+            if [ "$col_idx" -lt "$_TABLE_NUM_COLS" ]; then
+                local available=$((col_widths[col_idx] - min_w))
+                if [ "$available" -gt 0 ]; then
+                    if [ "$available" -ge "$excess" ]; then
+                        col_widths[col_idx]=$((col_widths[col_idx] - excess))
+                        excess=0
+                    else
+                        col_widths[col_idx]=$min_w
+                        excess=$((excess - available))
+                    fi
+                fi
+            fi
+        done
+    fi
+    
+    # Build border strings dynamically
+    local top_border="┌"
+    local header_sep="├"
+    local bottom_border="└"
+    
+    for ((col=0; col<_TABLE_NUM_COLS; col++)); do
+        local dashes=""
+        local j
+        for ((j=0; j<col_widths[col]+2; j++)); do
+            dashes+="─"
+        done
+        if [ "$col" -lt $((_TABLE_NUM_COLS - 1)) ]; then
+            top_border+="${dashes}┬"
+            header_sep+="${dashes}┼"
+            bottom_border+="${dashes}┴"
+        else
+            top_border+="${dashes}┐"
+            header_sep+="${dashes}┤"
+            bottom_border+="${dashes}┘"
+        fi
+    done
+    
+    # Print title if provided
+    [ -n "$title" ] && echo -e "${BLUE}${title}${NC}"
+    
+    # Print top border
+    echo "$top_border"
+    
+    # Print header row
+    local header_row="│"
+    for ((col=0; col<_TABLE_NUM_COLS; col++)); do
+        local cell
+        printf -v cell " %-${col_widths[col]}s " "${_TABLE_HEADERS[col]}"
+        header_row+="${cell}│"
+    done
+    echo "$header_row"
+    
+    # Print header separator
+    echo "$header_sep"
+    
+    # Print data rows with wrapping support
+    for ((row=0; row<_TABLE_NUM_ROWS; row++)); do
+        # Get all cell values for this row and wrap them
+        local -a row_cells=()
+        local -a wrapped_lines=()
+        local max_lines=1
+        
+        for ((col=0; col<_TABLE_NUM_COLS; col++)); do
+            local cell_val
+            cell_val=$(_table_get_cell "$col" "$row")
+            row_cells+=("$cell_val")
+            
+            # Wrap text if needed
+            local wrapped=""
+            if [ ${#cell_val} -le "${col_widths[col]}" ]; then
+                wrapped="$cell_val"
+            else
+                # Split into lines of col_width
+                local remaining="$cell_val"
+                local w="${col_widths[col]}"
+                while [ ${#remaining} -gt "$w" ]; do
+                    wrapped+="${remaining:0:$w}"$'\n'
+                    remaining="${remaining:$w}"
+                done
+                [ -n "$remaining" ] && wrapped+="$remaining"
+            fi
+            wrapped_lines+=("$wrapped")
+            
+            # Count lines
+            local line_count
+            line_count=$(echo "$wrapped" | wc -l)
+            [ "$line_count" -gt "$max_lines" ] && max_lines=$line_count
+        done
+        
+        # Print each line of the wrapped row
+        local line_num
+        for ((line_num=1; line_num<=max_lines; line_num++)); do
+            local row_line="│"
+            for ((col=0; col<_TABLE_NUM_COLS; col++)); do
+                local cell_line
+                cell_line=$(echo "${wrapped_lines[col]}" | sed -n "${line_num}p")
+                local cell
+                printf -v cell " %-${col_widths[col]}s " "$cell_line"
+                row_line+="${cell}│"
+            done
+            echo "$row_line"
+        done
+    done
+    
+    # Print bottom border
+    echo "$bottom_border"
+}
+# =============================================================================
+# END UNIFIED TABLE SYSTEM
+# =============================================================================
 
 # Validate GitHub URL
 validate_github_url() {
@@ -295,81 +1140,58 @@ update_commit_date() {
 
 get_last_commit_date() {
     local url="$1"
-    local repo_path
-    
-    # Extract owner and repo from URL
-    repo_path=$(echo "$url" | sed -E 's#https://github.com/(.+?)(\.git)?$#\1#')
-    
-    # Use a more reliable method - clone depth 1 and get the commit date locally
-    # This avoids GitHub API rate limits
-    local temp_dir=$(mktemp -d)
     local commit_date=""
     
-    if git clone --depth 1 "$url" "$temp_dir" >/dev/null 2>&1; then
-        # Get the last commit date from the cloned repository
-        commit_date=$(cd "$temp_dir" && git log -1 --format="%cI" 2>/dev/null)
-        # Clean up the temporary directory
-        rm -rf "$temp_dir"
-    else
-        # If git clone fails, try the GitHub API as a fallback
-        if command -v jq >/dev/null 2>&1; then
-            # Get last commit date using GitHub API with jq for proper JSON parsing
-            local response
-            response=$(curl -s -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/$repo_path/commits/HEAD")
+    # Extract owner and repo from GitHub URL
+    local owner repo api_url
+    
+    # Handle various GitHub URL formats
+    if [[ "$url" =~ github\.com[/:]([^/]+)/([^/.]+)(\.git)?$ ]]; then
+        owner="${BASH_REMATCH[1]}"
+        repo="${BASH_REMATCH[2]}"
+        
+        # Try GitHub API first (faster and works for large repos)
+        api_url="https://api.github.com/repos/$owner/$repo/commits?per_page=1"
+        
+        # Use curl with timeout to fetch commit info
+        local api_response
+        api_response=$(curl -s --max-time 10 "$api_url" 2>/dev/null)
+        
+        if [ -n "$api_response" ] && [ "$api_response" != "[]" ]; then
+            # Extract the commit date from JSON response
+            commit_date=$(echo "$api_response" | jq -r '.[0].commit.committer.date // empty' 2>/dev/null)
             
-            # Check for rate limit errors
-            if echo "$response" | grep -q "API rate limit exceeded"; then
-                echo "GitHub API rate limit exceeded. Using existing data." >&2
+            if [ -n "$commit_date" ] && [ "$commit_date" != "null" ]; then
+                echo "$commit_date"
                 return 0
-            fi
-            
-            commit_date=$(echo "$response" | jq -r '.commit.committer.date // empty')
-            
-            if [ -z "$commit_date" ]; then
-                # Try main branch if HEAD fails
-                response=$(curl -s -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/$repo_path/commits/main")
-                commit_date=$(echo "$response" | jq -r '.commit.committer.date // empty')
-            fi
-            
-            if [ -z "$commit_date" ]; then
-                # Try master branch if main fails
-                response=$(curl -s -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/$repo_path/commits/master")
-                commit_date=$(echo "$response" | jq -r '.commit.committer.date // empty')
-            fi
-        else
-            # Fallback to grep if jq is not available
-            local response
-            response=$(curl -s -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/$repo_path/commits/HEAD")
-                
-            # Check for rate limit errors
-            if echo "$response" | grep -q "API rate limit exceeded"; then
-                echo "GitHub API rate limit exceeded. Using existing data." >&2
-                return 0
-            fi
-            
-            commit_date=$(echo "$response" | grep -o '"date": "[^"]*' | head -1 | cut -d'"' -f4)
-            
-            if [ -z "$commit_date" ]; then
-                # Try main branch if HEAD fails
-                commit_date=$(curl -s -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/$repo_path/commits/main" | \
-                    grep -o '"date": "[^"]*' | head -1 | cut -d'"' -f4)
-            fi
-            
-            if [ -z "$commit_date" ]; then
-                # Try master branch if main fails
-                commit_date=$(curl -s -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/$repo_path/commits/master" | \
-                    grep -o '"date": "[^"]*' | head -1 | cut -d'"' -f4)
             fi
         fi
     fi
     
-    echo "$commit_date"
+    # Fallback: Try git ls-remote to get latest commit (works for any git repo)
+    local latest_sha
+    latest_sha=$(timeout 15s git ls-remote --heads "$url" 2>/dev/null | head -1 | awk '{print $1}')
+    
+    if [ -n "$latest_sha" ]; then
+        # For non-GitHub repos or if API failed, try shallow clone as last resort
+        local temp_dir
+        temp_dir=$(mktemp -d)
+        
+        if timeout 30s git clone --depth 1 --single-branch "$url" "$temp_dir" >/dev/null 2>&1; then
+            commit_date=$(cd "$temp_dir" && git log -1 --format="%cI" 2>/dev/null)
+            rm -rf "$temp_dir"
+            
+            if [ -n "$commit_date" ]; then
+                echo "$commit_date"
+                return 0
+            fi
+        else
+            rm -rf "$temp_dir"
+        fi
+    fi
+    
+    # Return "Unknown" if all methods failed
+    echo "Unknown"
 }
 
 # Parse gitbuildfile
@@ -394,6 +1216,7 @@ parse_gitbuildfile() {
     local make_flags=""
     local cmake_flags=""
     local binary_path=""
+    local notes=""
     
     # Parse each line in the file
     while IFS= read -r line; do
@@ -437,13 +1260,18 @@ parse_gitbuildfile() {
                 BINARY_PATH)
                     binary_path="$value"
                     ;;
+                NOTES)
+                    notes="$value"
+                    ;;
             esac
         fi
     done < "$gitbuildfile"
     
-    # Update database with gitbuildfile information
+    # Update database with gitbuildfile information (escape all values)
     if [ -n "$build_method" ]; then
-        sqlite3 "$DB_FILE" "UPDATE repositories SET build_type = '$build_method' WHERE id = $repo_id;"
+        local escaped_method
+        escaped_method=$(sql_escape "$build_method")
+        sqlite3 "$DB_FILE" "UPDATE repositories SET build_type = '$escaped_method' WHERE id = $repo_id;"
     fi
     
     if [ -n "$build_file" ]; then
@@ -451,7 +1279,9 @@ parse_gitbuildfile() {
         if [[ "$build_file" != /* ]]; then
             build_file="$repo_dir/$build_file"
         fi
-        sqlite3 "$DB_FILE" "UPDATE repositories SET build_file_path = '$build_file' WHERE id = $repo_id;"
+        local escaped_build_file
+        escaped_build_file=$(sql_escape "$build_file")
+        sqlite3 "$DB_FILE" "UPDATE repositories SET build_file_path = '$escaped_build_file' WHERE id = $repo_id;"
     fi
     
     if [ -n "$binary_path" ]; then
@@ -459,7 +1289,9 @@ parse_gitbuildfile() {
         if [[ "$binary_path" != /* ]]; then
             binary_path="$repo_dir/$binary_path"
         fi
-        sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$binary_path' WHERE id = $repo_id;"
+        local escaped_binary_path
+        escaped_binary_path=$(sql_escape "$binary_path")
+        sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$escaped_binary_path' WHERE id = $repo_id;"
     fi
     
     # Update build configuration
@@ -477,6 +1309,13 @@ parse_gitbuildfile() {
     
     if [ -n "$dependencies" ]; then
         update_build_config "$repo_id" "dependencies" "$dependencies"
+    fi
+    
+    if [ -n "$notes" ]; then
+        # Store notes in database
+        local escaped_notes
+        escaped_notes=$(sql_escape "$notes")
+        sqlite3 "$DB_FILE" "INSERT OR REPLACE INTO repository_notes (repo_id, notes) VALUES ($repo_id, '$escaped_notes');"
     fi
     
     echo -e "${GREEN}Successfully parsed gitbuildfile${NC}"
@@ -660,7 +1499,8 @@ get_build_type() {
 # Update all repositories' commit information
 update_all_repos() {
     echo -e "\n${BLUE}Updating repository information...${NC}"
-    local total updated=0
+    local total
+    local updated=0
     total=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM repositories WHERE deleted = 0;")
     
     while IFS='|' read -r id name url; do
@@ -686,12 +1526,12 @@ get_build_config() {
     
     # Get build configuration from database
     local config
-    config=$(sqlite3 "$DB_FILE" "SELECT configure_flags, make_flags, cmake_flags, dependencies FROM build_configs WHERE repo_id = $repo_id;")
+    config=$(sqlite3 "$DB_FILE" "SELECT configure_flags, make_flags, cmake_flags, dependencies, COALESCE(strip_debug, 0), COALESCE(use_ramdisk, 0) FROM build_configs WHERE repo_id = $repo_id;")
     
     # If no config exists, create an empty one
     if [ -z "$config" ]; then
-        sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies) VALUES ($repo_id, '', '', '', '');"
-        echo "||||"
+        sqlite3 "$DB_FILE" "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies, strip_debug, use_ramdisk) VALUES ($repo_id, '', '', '', '', 0, 0);"
+        echo "||||0|0"
     else
         echo "$config"
     fi
@@ -703,8 +1543,8 @@ update_build_config() {
     local field="$2"
     local value="$3"
     
-    # Escape single quotes in the value
-    value=$(echo "$value" | sed "s/'/''/g")
+    # Escape value for SQL
+    value=$(sql_escape "$value")
     
     # Check if the build config exists
     local exists
@@ -891,9 +1731,46 @@ find_binary() {
 }
 
 # Handle build result
-browse_for_binary() {
-    # Direct file browser implementation with temporary file output
+# =============================================================================
+# UNIFIED FILE BROWSER
+# =============================================================================
+# Usage: file_browser <start_dir> <mode> [filter_pattern]
+# Modes:
+#   binary     - Show only executable files (default)
+#   file       - Show all files
+#   gitbuildfile - Show only gitbuildfile files
+#   directory  - Allow directory selection
+# Returns: 0 on selection, 1 on cancel
+# Selected path is saved to /tmp/gitbuilder_selected_file
+
+file_browser() {
     local start_dir="$1"
+    local mode="${2:-binary}"
+    local filter_pattern="${3:-}"
+    local title="FILE BROWSER"
+    local file_label="FILES"
+    local temp_file="/tmp/gitbuilder_selected_file"
+    
+    # Set mode-specific options
+    case "$mode" in
+        binary)
+            title="FILE BROWSER - Select a binary"
+            file_label="EXECUTABLE FILES"
+            ;;
+        file)
+            title="FILE BROWSER - Select a file"
+            file_label="FILES"
+            ;;
+        gitbuildfile)
+            title="FILE BROWSER - Select a gitbuildfile"
+            file_label="GITBUILDFILES"
+            filter_pattern="gitbuildfile*"
+            ;;
+        directory)
+            title="FILE BROWSER - Select a directory"
+            file_label="(Select a directory)"
+            ;;
+    esac
     
     # Ensure the directory exists
     if [ ! -d "$start_dir" ]; then
@@ -902,15 +1779,16 @@ browse_for_binary() {
     fi
     
     # Remove any existing temporary file
-    rm -f "/tmp/gitbuilder_selected_binary"
+    rm -f "$temp_file"
     
-    local current_dir=$(realpath "$start_dir")
+    local current_dir
+    current_dir=$(realpath "$start_dir")
     
     while true; do
         # Clear screen and show header
         clear
         echo "=========================================="
-        echo "FILE BROWSER - Select a binary"
+        echo "$title"
         echo "Current directory: $current_dir"
         echo "=========================================="
         
@@ -918,35 +1796,90 @@ browse_for_binary() {
         echo "0) .. (Go to parent directory)"
         
         # Initialize arrays for menu items
-        declare -a items_path
-        declare -a items_type
+        declare -a items_path=()
+        declare -a items_type=()
         local count=1
         
-        # First list directories
+        # List directories
         echo 
         echo "DIRECTORIES:"
+        local has_dirs=false
         for d in "$current_dir"/*/; do
-            if [ -d "$d" ]; then
-                local name=$(basename "$d")
+            if [ -d "$d" ] 2>/dev/null; then
+                local name
+                name=$(basename "$d")
                 echo "$count) [DIR] $name/"
                 items_path[$count]="$d"
                 items_type[$count]="dir"
-                count=$((count+1))
+                ((count++)) || true
+                has_dirs=true
             fi
         done
+        [ "$has_dirs" = false ] && echo "   (no subdirectories)"
         
-        # Then list executable files
+        # List files based on mode
         echo 
-        echo "EXECUTABLE FILES:"
-        for f in "$current_dir"/*; do
-            if [ -f "$f" ] && [ -x "$f" ]; then
-                local name=$(basename "$f")
-                echo "$count) [BIN] $name"
-                items_path[$count]="$f"
-                items_type[$count]="bin"
-                count=$((count+1))
-            fi
-        done
+        echo "$file_label:"
+        local has_files=false
+        
+        case "$mode" in
+            binary)
+                for f in "$current_dir"/*; do
+                    if [ -f "$f" ] && [ -x "$f" ]; then
+                        local name
+                        name=$(basename "$f")
+                        echo "$count) [BIN] $name"
+                        items_path[$count]="$f"
+                        items_type[$count]="file"
+                        ((count++)) || true
+                        has_files=true
+                    fi
+                done
+                ;;
+            file)
+                for f in "$current_dir"/*; do
+                    if [ -f "$f" ]; then
+                        local name
+                        name=$(basename "$f")
+                        echo "$count) $name"
+                        items_path[$count]="$f"
+                        items_type[$count]="file"
+                        ((count++)) || true
+                        has_files=true
+                    fi
+                done
+                ;;
+            gitbuildfile)
+                # Show files matching gitbuildfile* pattern
+                for f in "$current_dir"/gitbuildfile* "$current_dir"/gitbuildfile; do
+                    if [ -f "$f" ] 2>/dev/null; then
+                        local name
+                        name=$(basename "$f")
+                        # Avoid duplicates
+                        local already_added=false
+                        for existing in "${items_path[@]}"; do
+                            [ "$existing" = "$f" ] && already_added=true && break
+                        done
+                        if [ "$already_added" = false ]; then
+                            echo "$count) $name"
+                            items_path[$count]="$f"
+                            items_type[$count]="file"
+                            ((count++)) || true
+                            has_files=true
+                        fi
+                    fi
+                done
+                ;;
+            directory)
+                # In directory mode, allow selecting current directory
+                echo "$count) [SELECT THIS DIRECTORY]"
+                items_path[$count]="$current_dir"
+                items_type[$count]="select_dir"
+                ((count++)) || true
+                has_files=true
+                ;;
+        esac
+        [ "$has_files" = false ] && echo "   (no matching files)"
         
         # Show navigation options
         echo 
@@ -955,11 +1888,10 @@ browse_for_binary() {
         
         # Get user selection
         echo -n "Select option (0-$((count-1)), q to quit): "
-        read choice
+        read -r choice
         
         # Process the selection
-        if [ "$choice" = "q" ]; then
-            # User wants to quit
+        if [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
             return 1
         elif [ "$choice" = "0" ]; then
             # Go to parent directory
@@ -967,21 +1899,34 @@ browse_for_binary() {
                 current_dir=$(dirname "$current_dir")
             fi
         elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$count" ]; then
-            # Valid selection
-            if [ "${items_type[$choice]}" = "dir" ]; then
+            local item_type="${items_type[$choice]}"
+            local item_path="${items_path[$choice]}"
+            
+            if [ "$item_type" = "dir" ]; then
                 # Navigate to selected directory
-                current_dir="${items_path[$choice]}"
-            elif [ "${items_type[$choice]}" = "bin" ]; then
-                # Save selected binary path to temporary file
-                echo "${items_path[$choice]}" > "/tmp/gitbuilder_selected_binary"
+                current_dir="$item_path"
+            elif [ "$item_type" = "file" ] || [ "$item_type" = "select_dir" ]; then
+                # Save selected path to temporary file
+                echo "$item_path" > "$temp_file"
                 return 0
             fi
         else
-            # Invalid selection
             echo "Invalid selection. Press any key to continue..."
-            read -n 1
+            read -r -n 1
         fi
     done
+}
+
+# Wrapper for backward compatibility
+browse_for_binary() {
+    local start_dir="$1"
+    file_browser "$start_dir" "binary"
+    local status=$?
+    # Copy to old temp file location for compatibility
+    if [ -f "/tmp/gitbuilder_selected_file" ]; then
+        cp "/tmp/gitbuilder_selected_file" "/tmp/gitbuilder_selected_binary"
+    fi
+    return $status
 }
 
 # Handle build result
@@ -995,6 +1940,15 @@ handle_build_result() {
     
     if [ "$success" -eq 0 ]; then
         echo -e "\n${GREEN}Build completed successfully!${NC}"
+        
+        # Display repository notes if they exist
+        local notes
+        notes=$(sqlite3 "$DB_FILE" "SELECT notes FROM repository_notes WHERE repo_id = $repo_id;" || echo "")
+        if [ -n "$notes" ]; then
+            echo -e "\n${YELLOW}Repository Notes:${NC}"
+            echo -e "${CYAN}$notes${NC}"
+            echo ""
+        fi
         
         # Look for potential binary files
         echo -e "\n${BLUE}Looking for binary files...${NC}"
@@ -1100,16 +2054,59 @@ execute_build() {
     # Create a unique log file for this build
     log_file="$log_dir/build_$(date +%Y%m%d_%H%M%S).log"
     
+    # Record build start time for history
+    local build_start_time
+    build_start_time=$(date +%s)
+    
     # Get build configuration
-    local configure_flags make_flags cmake_flags
-    IFS='|' read -r configure_flags make_flags cmake_flags < <(get_build_config "$repo_id")
+    local configure_flags make_flags cmake_flags dependencies strip_debug use_ramdisk
+    IFS='|' read -r configure_flags make_flags cmake_flags dependencies strip_debug use_ramdisk < <(get_build_config "$repo_id")
+    
+    # Add parallel jobs flag if not already specified in make_flags
+    if [[ ! "$make_flags" =~ -j[[:space:]]*[0-9]+ ]]; then
+        make_flags="-j${PARALLEL_JOBS} ${make_flags}"
+    fi
+    # Trim any leading/trailing whitespace from make_flags
+    make_flags="${make_flags## }"
+    make_flags="${make_flags%% }"
+    
+    # Handle strip debug symbols option
+    local cflags_extra=""
+    if [ "$strip_debug" = "1" ]; then
+        cflags_extra="-O2 -DNDEBUG"
+        echo -e "${CYAN}Debug symbols will be stripped (optimized build)${NC}"
+    fi
+    
+    # Handle RAM disk option
+    local actual_build_dir="$dir"
+    if [ "$use_ramdisk" = "1" ] && can_use_ramdisk; then
+        local available_mb
+        available_mb=$(get_available_ram_mb)
+        local size_mb=$((available_mb / 2))
+        [ "$size_mb" -gt 4096 ] && size_mb=4096
+        [ "$size_mb" -lt 512 ] && size_mb=512
+        
+        if setup_ramdisk "$size_mb"; then
+            actual_build_dir="$RAMDISK_MOUNT_POINT"
+            echo -e "${CYAN}Building on RAM disk for faster compilation${NC}"
+            # Copy source to RAM disk
+            echo -e "${BLUE}Copying source to RAM disk...${NC}"
+            cp -a "$dir"/* "$actual_build_dir/" 2>/dev/null || true
+        fi
+    fi
     
     # Get repository name
     local name
     name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;")
     
-    echo -e "\n${BLUE}Building with $type...${NC}"
+    echo -e "\n${BLUE}Building with $type using ${PARALLEL_JOBS} parallel jobs...${NC}"
     echo "Build output will be saved to: $log_file"
+    
+    # Set up CFLAGS for optimized builds
+    local cflags_env=""
+    if [ -n "$cflags_extra" ]; then
+        cflags_env="CFLAGS=\"$cflags_extra\" CXXFLAGS=\"$cflags_extra\""
+    fi
     
     # Special handling for Atari800
     if [ "$name" = "Atari800" ]; then
@@ -1117,7 +2114,10 @@ execute_build() {
         
         # Create a subshell to maintain directory state
         (
-            cd "$dir" || exit 1
+            cd "$actual_build_dir" || exit 1
+            
+            # Export CFLAGS if stripping debug
+            [ -n "$cflags_extra" ] && export CFLAGS="$cflags_extra" CXXFLAGS="$cflags_extra"
             
             # Run the build process
             {
@@ -1134,22 +2134,27 @@ execute_build() {
     else
         # Create a subshell to maintain directory state
         (
+            # Export CFLAGS if stripping debug
+            [ -n "$cflags_extra" ] && export CFLAGS="$cflags_extra" CXXFLAGS="$cflags_extra"
+            
             case "$type" in
                 "cmake")
                     # Create build directory if it doesn't exist
-                    build_dir="$dir/build"
+                    build_dir="$actual_build_dir/build"
                     mkdir -p "$build_dir"
                     cd "$build_dir" || exit 1
                     
-                    # Run cmake with progress
+                    # Run cmake with progress (add release type if stripping debug)
+                    local cmake_build_type=""
+                    [ -n "$cflags_extra" ] && cmake_build_type="-DCMAKE_BUILD_TYPE=Release"
                     {
-                        cmake ${args[@]:-} $cmake_flags .. && \
+                        cmake ${args[@]:-} $cmake_flags $cmake_build_type .. && \
                         make $make_flags
                     } > "$log_file" 2>&1
                     ;;
                     
                 "autogen")
-                    cd "$dir" || exit 1
+                    cd "$actual_build_dir" || exit 1
                     
                     # Run autogen.sh, configure, and make
                     {
@@ -1165,7 +2170,7 @@ execute_build() {
                     ;;
                     
                 "autotools" | "custom-configure")
-                    cd "$dir" || exit 1
+                    cd "$actual_build_dir" || exit 1
                     
                     # Run configure and make
                     {
@@ -1178,7 +2183,7 @@ execute_build() {
                     ;;
                     
                 "make")
-                    cd "$dir" || exit 1
+                    cd "$actual_build_dir" || exit 1
                     
                     # Special handling for MAME
                     if [ -f "makefile" ] && grep -q "MAMEMESS" "makefile" 2>/dev/null; then
@@ -1192,16 +2197,16 @@ execute_build() {
                     ;;
                     
                 "gradle")
-                    cd "$dir" || exit 1
+                    cd "$actual_build_dir" || exit 1
                     {
-                        echo "Running gradle build..." >> "$log_file"
+                        echo "Running gradle build with ${PARALLEL_JOBS} workers..." >> "$log_file"
                         # Check if gradlew exists and is executable
                         if [ -x "./gradlew" ]; then
                             echo "Using Gradle wrapper..." >> "$log_file"
-                            ./gradlew build
+                            ./gradlew build --parallel --max-workers=${PARALLEL_JOBS}
                         elif command -v gradle >/dev/null 2>&1; then
                             echo "Using system Gradle..." >> "$log_file"
-                            gradle build
+                            gradle build --parallel --max-workers=${PARALLEL_JOBS}
                         else
                             echo "Error: Neither Gradle wrapper nor system Gradle found" >> "$log_file"
                             exit 1
@@ -1210,15 +2215,15 @@ execute_build() {
                     ;;
                     
                 "maven")
-                    cd "$dir" || exit 1
+                    cd "$actual_build_dir" || exit 1
                     {
-                        echo "Running maven build..." >> "$log_file"
-                        mvn clean install
+                        echo "Running maven build with ${PARALLEL_JOBS} threads..." >> "$log_file"
+                        mvn clean install -T ${PARALLEL_JOBS}
                     } > "$log_file" 2>&1
                     ;;
                     
                 "python")
-                    cd "$dir" || exit 1
+                    cd "$actual_build_dir" || exit 1
                     {
                         echo "Building Python package..." >> "$log_file"
                         python setup.py build
@@ -1226,7 +2231,7 @@ execute_build() {
                     ;;
                     
                 "node")
-                    cd "$dir" || exit 1
+                    cd "$actual_build_dir" || exit 1
                     {
                         echo "Building Node.js package..." >> "$log_file"
                         npm install && npm run build
@@ -1234,10 +2239,12 @@ execute_build() {
                     ;;
                     
                 "meson")
-                    cd "$dir" || exit 1
+                    cd "$actual_build_dir" || exit 1
                     {
-                        echo "Running meson build..." >> "$log_file"
-                        meson build && cd build && ninja
+                        echo "Running meson build with ${PARALLEL_JOBS} jobs..." >> "$log_file"
+                        local meson_buildtype=""
+                        [ -n "$cflags_extra" ] && meson_buildtype="--buildtype=release"
+                        meson build $meson_buildtype && cd build && ninja -j ${PARALLEL_JOBS}
                     } > "$log_file" 2>&1
                     ;;
                     
@@ -1266,13 +2273,33 @@ execute_build() {
     wait $pid
     local status=$?
     
+    # If we used RAM disk, copy results back and cleanup
+    if [ "$actual_build_dir" != "$dir" ] && [ "$RAMDISK_ACTIVE" = true ]; then
+        if [ $status -eq 0 ]; then
+            echo -e "${BLUE}Copying build results from RAM disk...${NC}"
+            # Copy back the built files (binaries, libraries, etc.)
+            rsync -a --exclude='.git' "$actual_build_dir/" "$dir/" 2>/dev/null || \
+                cp -a "$actual_build_dir"/* "$dir/" 2>/dev/null || true
+        fi
+        # Cleanup RAM disk
+        cleanup_ramdisk
+    fi
+    
     if [ $status -eq 0 ]; then
         echo -e "${GREEN}Build completed successfully!${NC}"
+        # Record in build history
+        record_build_history "$repo_id" 0 "$log_file" "$build_start_time"
         handle_build_result "$repo_id" "$dir" 0 "$log_file"
+        # Send notification
+        send_notification "Build Complete" "$name built successfully"
         return 0
     else
         echo -e "${RED}Build failed!${NC}"
+        # Record in build history
+        record_build_history "$repo_id" 1 "$log_file" "$build_start_time"
         handle_build_result "$repo_id" "$dir" 1 "$log_file"
+        # Send notification
+        send_notification "Build Failed" "$name build failed"
         return 1
     fi
 }
@@ -1353,7 +2380,9 @@ add_repo() {
             continue
         fi
         # Check if an active repository with this name exists
-        if [ "$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM repositories WHERE name = '$name';")" -gt 0 ]; then
+        local escaped_name
+        escaped_name=$(sql_escape "$name")
+        if [ "$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM repositories WHERE name = '$escaped_name';")" -gt 0 ]; then
             echo -e "${RED}A repository with this name already exists${NC}"
             continue
         fi
@@ -1375,6 +2404,25 @@ add_repo() {
     local commit_date
     commit_date=$(get_last_commit_date "$url")
     
+    # Ask about build optimization options
+    echo -e "\n${CYAN}Build Options${NC}"
+    local strip_debug=0
+    read -rp "Strip debug symbols for smaller/faster binaries? (y/N): " strip_choice
+    if [[ "$strip_choice" =~ ^[Yy]$ ]]; then
+        strip_debug=1
+    fi
+    
+    local use_ramdisk=0
+    local available_mb
+    available_mb=$(get_available_ram_mb)
+    if can_use_ramdisk; then
+        echo -e "Available RAM: ${GREEN}${available_mb}MB${NC}"
+        read -rp "Use RAM disk for builds when available? (y/N): " ramdisk_choice
+        if [[ "$ramdisk_choice" =~ ^[Yy]$ ]]; then
+            use_ramdisk=1
+        fi
+    fi
+    
     # Check if we need to rebuild indexes first
     local max_id expected_max_id
     max_id=$(sqlite3 "$DB_FILE" "SELECT MAX(id) FROM repositories;")
@@ -1385,18 +2433,43 @@ add_repo() {
         rebuild_db_indexes
     fi
     
-    # Add the new repository
-    sqlite3 "$DB_FILE" <<EOF
-INSERT INTO repositories (name, url, last_commit)
-VALUES ('$name', '$url', '$commit_date');
-EOF
+    # Add the new repository - escape values to prevent SQL injection
+    local escaped_name escaped_url escaped_commit
+    escaped_name=$(sql_escape "$name")
+    escaped_url=$(sql_escape "$url")
+    escaped_commit=$(sql_escape "$commit_date")
+    
+    sqlite3 "$DB_FILE" "INSERT INTO repositories (name, url, last_commit) VALUES ('$escaped_name', '$escaped_url', '$escaped_commit');"
+    
+    # Get the new repository ID and create build config in a transaction
+    local new_id
+    new_id=$(sqlite3 "$DB_FILE" "SELECT last_insert_rowid();")
+    
+    db_transaction "INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies, strip_debug, use_ramdisk) VALUES ($new_id, '', '', '', '', $strip_debug, $use_ramdisk);"
+    
     success "Repository '$name' added successfully" wait
 }
 
 # Edit repository
 edit_repo() {
-    local id name url
-    read -rp "Enter repository ID to edit: " id
+    local id="$1"
+    local name url
+    
+    # Validate ID
+    if [[ -z "$id" ]] || ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        error "Invalid repository ID: $id"
+        return 1
+    fi
+    
+    # Check if repository exists
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $id AND deleted = 0;")
+    if [ -z "$repo_name" ]; then
+        error "Repository ID $id not found"
+        return 1
+    fi
+    
+    echo -e "\n${BLUE}Editing repository: $repo_name (ID: $id)${NC}"
     read -rp "Enter new name (or press enter to skip): " name
     read -rp "Enter new URL (or press enter to skip): " url
     
@@ -1425,33 +2498,6 @@ edit_repo() {
     
     sqlite3 "$DB_FILE" "UPDATE repositories SET $update_str WHERE id = $id AND deleted = 0;"
     success "Repository updated successfully"
-}
-
-# Resequence repository IDs
-resequence_ids() {
-    sqlite3 "$DB_FILE" <<EOF
-    CREATE TABLE temp_repos AS 
-    SELECT NULL as id, name, url, last_commit, last_built, created_at, deleted 
-    FROM repositories 
-    ORDER BY id;
-    
-    DROP TABLE repositories;
-    
-    CREATE TABLE repositories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        url TEXT NOT NULL,
-        last_commit TEXT,
-        last_built TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        deleted INTEGER DEFAULT 0
-    );
-    
-    INSERT INTO repositories (name, url, last_commit, last_built, created_at, deleted)
-    SELECT name, url, last_commit, last_built, created_at, deleted FROM temp_repos;
-    
-    DROP TABLE temp_repos;
-EOF
 }
 
 # Cleanup repository files
@@ -1602,15 +2648,6 @@ download_build() {
     success "Package built successfully"
 }
 
-# Display repositories table
-# Legacy function - now just calls update_commit_date
-update_last_commit_date() {
-    local id="$1"
-    local url="$2"
-    
-    update_commit_date "$id" "$url"
-}
-
 # Record build type in database
 record_build_type() {
     local repo_id="$1"
@@ -1630,8 +2667,7 @@ show_build_details() {
     fi
     
     while true; do
-        # Clear the screen
-        printf "\033c"
+        show_standard_layout
         
         # Get repository details
         local repo_info
@@ -1648,8 +2684,15 @@ show_build_details() {
         IFS='|' read -r name url last_commit last_commit_check last_built build_success binary_path build_type build_file_path created_at <<< "$repo_info"
         
         # Get build configuration
-        local configure_flags make_flags cmake_flags dependencies
-        IFS='|' read -r configure_flags make_flags cmake_flags dependencies <<< "$(get_build_config "$repo_id")"
+        local configure_flags make_flags cmake_flags dependencies strip_debug use_ramdisk
+        IFS='|' read -r configure_flags make_flags cmake_flags dependencies strip_debug use_ramdisk <<< "$(get_build_config "$repo_id")"
+        
+        # Format strip_debug and use_ramdisk for display
+        local strip_debug_status="${RED}No${NC}"
+        [ "$strip_debug" = "1" ] && strip_debug_status="${GREEN}Yes${NC}"
+        
+        local use_ramdisk_status="${RED}No${NC}"
+        [ "$use_ramdisk" = "1" ] && use_ramdisk_status="${GREEN}Yes${NC}"
         
         # Format build success status
         local build_status="Unknown"
@@ -1687,7 +2730,7 @@ show_build_details() {
         fi
         
         # Display repository details as a menu
-        echo -e "\n${BLUE}Repository Details - Select an option to edit${NC}"
+        echo -e "${YELLOW}GitHub Package Manager - Repository Details (ID: $repo_id)${NC}"
         echo -e "1) ${YELLOW}Name:${NC}              $name"
         echo -e "2) ${YELLOW}URL:${NC}               $url"
         echo -e "3) ${YELLOW}Added on:${NC}          $formatted_created_date (not editable)"
@@ -1706,21 +2749,37 @@ show_build_details() {
         echo -e "14) ${YELLOW}CMake flags:${NC}       $cmake_flags"
         echo -e "15) ${YELLOW}Dependencies:${NC}      $dependencies"
         
+        echo -e "\n${BLUE}Build Optimization${NC}"
+        echo -e "16) ${YELLOW}Strip debug symbols:${NC} $strip_debug_status"
+        echo -e "17) ${YELLOW}Use RAM disk:${NC}        $use_ramdisk_status"
+        
         echo -e "\n${BLUE}Actions${NC}"
-        echo -e "16) Rebuild repository"
-        echo -e "17) Launch binary"
-        echo -e "0) Return to main menu"
+        echo -e "18) Rebuild repository"
+        echo -e "19) Launch binary"
         
         # Get user choice
         echo
-        read -rp "Select an option (0-17): " choice
+        read_with_esc "Select option (1-19): " choice
+        local esc_status=$?
         
+        # Handle Esc key - return to main menu
+        if [ $esc_status -eq 27 ]; then
+            return 0
+        fi
+        
+        # Handle help key
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+        esac
+        
+        # Handle menu options
         case "$choice" in
-            0) return 0 ;;
             1) # Edit name
                 read -rp "Enter new repository name: " new_name
                 if [ -n "$new_name" ]; then
-                    sqlite3 "$DB_FILE" "UPDATE repositories SET name = '$new_name' WHERE id = $repo_id;"
+                    local escaped_new_name
+                    escaped_new_name=$(sql_escape "$new_name")
+                    sqlite3 "$DB_FILE" "UPDATE repositories SET name = '$escaped_new_name' WHERE id = $repo_id;"
                     echo -e "${GREEN}Repository name updated${NC}"
                     sleep 1
                 fi
@@ -1728,7 +2787,9 @@ show_build_details() {
             2) # Edit URL
                 read -rp "Enter new repository URL: " new_url
                 if [ -n "$new_url" ]; then
-                    sqlite3 "$DB_FILE" "UPDATE repositories SET url = '$new_url' WHERE id = $repo_id;"
+                    local escaped_new_url
+                    escaped_new_url=$(sql_escape "$new_url")
+                    sqlite3 "$DB_FILE" "UPDATE repositories SET url = '$escaped_new_url' WHERE id = $repo_id;"
                     echo -e "${GREEN}Repository URL updated${NC}"
                     sleep 1
                 fi
@@ -1779,13 +2840,19 @@ show_build_details() {
                         ;;
                     2) # Enter path manually
                         read -rp "Enter new binary path: " new_path
-                        if [ -n "$new_path" ] && [ -x "$new_path" ]; then
-                            sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$new_path' WHERE id = $repo_id;"
-                            echo -e "${GREEN}Binary path updated${NC}"
-                            sleep 1
-                        elif [ -n "$new_path" ]; then
-                            echo -e "${RED}Error: File does not exist or is not executable${NC}"
-                            sleep 2
+                        if [ -n "$new_path" ]; then
+                            # Sanitize and validate path
+                            new_path=$(sanitize_path "$new_path")
+                            if [ -x "$new_path" ]; then
+                                local escaped_path
+                                escaped_path=$(sql_escape "$new_path")
+                                sqlite3 "$DB_FILE" "UPDATE repositories SET binary_path = '$escaped_path' WHERE id = $repo_id;"
+                                echo -e "${GREEN}Binary path updated${NC}"
+                                sleep 1
+                            else
+                                echo -e "${RED}Error: File does not exist or is not executable${NC}"
+                                sleep 2
+                            fi
                         fi
                         ;;
                     *) 
@@ -1840,13 +2907,19 @@ show_build_details() {
                         ;;
                     2) # Enter path manually
                         read -rp "Enter new build file path: " new_path
-                        if [ -n "$new_path" ] && [ -f "$new_path" ]; then
-                            sqlite3 "$DB_FILE" "UPDATE repositories SET build_file_path = '$new_path' WHERE id = $repo_id;"
-                            echo -e "${GREEN}Build file path updated${NC}"
-                            sleep 1
-                        elif [ -n "$new_path" ]; then
-                            echo -e "${RED}Error: File does not exist${NC}"
-                            sleep 2
+                        if [ -n "$new_path" ]; then
+                            # Sanitize and validate path
+                            new_path=$(sanitize_path "$new_path")
+                            if [ -f "$new_path" ]; then
+                                local escaped_path
+                                escaped_path=$(sql_escape "$new_path")
+                                sqlite3 "$DB_FILE" "UPDATE repositories SET build_file_path = '$escaped_path' WHERE id = $repo_id;"
+                                echo -e "${GREEN}Build file path updated${NC}"
+                                sleep 1
+                            else
+                                echo -e "${RED}Error: File does not exist${NC}"
+                                sleep 2
+                            fi
                         fi
                         ;;
                     *) 
@@ -1887,14 +2960,40 @@ show_build_details() {
                     sleep 1
                 fi
                 ;;
-            16) # Rebuild repository
+            16) # Toggle strip debug symbols
+                if [ "$strip_debug" = "1" ]; then
+                    update_build_config "$repo_id" "strip_debug" "0"
+                    echo -e "${GREEN}Debug symbols will be kept${NC}"
+                else
+                    update_build_config "$repo_id" "strip_debug" "1"
+                    echo -e "${GREEN}Debug symbols will be stripped (smaller/faster binaries)${NC}"
+                fi
+                sleep 1
+                ;;
+            17) # Toggle use RAM disk
+                if [ "$use_ramdisk" = "1" ]; then
+                    update_build_config "$repo_id" "use_ramdisk" "0"
+                    echo -e "${GREEN}RAM disk disabled for builds${NC}"
+                else
+                    local available_mb
+                    available_mb=$(get_available_ram_mb)
+                    if can_use_ramdisk; then
+                        update_build_config "$repo_id" "use_ramdisk" "1"
+                        echo -e "${GREEN}RAM disk enabled for builds (${available_mb}MB available)${NC}"
+                    else
+                        echo -e "${RED}Insufficient RAM available (${available_mb}MB, need ${RAMDISK_MIN_FREE_MB}MB)${NC}"
+                    fi
+                fi
+                sleep 1
+                ;;
+            18) # Rebuild repository
                 printf "\033c"
                 echo -e "${BLUE}Rebuilding repository $name...${NC}"
                 download_build "$repo_id" "rebuild"
                 echo -e "\n${GREEN}Rebuild complete${NC}"
                 sleep 2
                 ;;
-            17) # Launch binary
+            19) # Launch binary
                 printf "\033c"
                 launch_binary "$repo_id"
                 echo -e "\n${GREEN}Press any key to continue...${NC}"
@@ -1908,40 +3007,10 @@ show_build_details() {
     done
 }
 
+# Display repositories table with full date format
 show_repos() {
-    # First, update commit dates for repositories with missing or old commit dates
-    echo -e "${BLUE}Updating repository information...${NC}"
-    while IFS='|' read -r id name url last_commit; do
-        # If last_commit is empty or older than 1 day, update it
-        if [ -z "$last_commit" ] || [ "$(date -d "$last_commit" +%s 2>/dev/null || echo 0)" -lt "$(date -d "1 day ago" +%s)" ]; then
-            update_last_commit_date "$id" "$url"
-        fi
-    done < <(sqlite3 "$DB_FILE" "SELECT id, name, url, last_commit FROM repositories WHERE deleted = 0;")
-    
-    echo -e "${BLUE}Available Repositories:${NC}"
-    echo "┌────┬────────────────┬──────────────────────────┬─────────────────────┬─────────────────────┬────────┐"
-    echo "│ ID │ Name           │ URL                      │ Last Commit         │ Last Built          │ Binary │"
-    echo "├────┼────────────────┼──────────────────────────┼─────────────────────┼─────────────────────┼────────┤"
-    
-    # Now display the repositories with updated commit dates
-    while IFS='|' read -r id name url last_commit last_built binary_path; do
-        local binary_status="No"
-        if [ -n "$binary_path" ] && [ -x "$binary_path" ]; then
-            binary_status="Yes"
-        fi
-        
-        # Format the last commit date nicely
-        local formatted_commit_date=""
-        if [ -n "$last_commit" ]; then
-            formatted_commit_date=$(date -d "$last_commit" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last_commit")
-        fi
-        
-        printf "│ %-2s │ %-14s │ %-24s │ %-19s │ %-19s │ %-6s │\n" \
-            "$id" "${name:0:14}" "${url:0:24}" \
-            "${formatted_commit_date:0:19}" "${last_built:0:19}" "$binary_status"
-    done < <(sqlite3 "$DB_FILE" "SELECT id, name, url, last_commit, last_built, binary_path FROM repositories WHERE deleted = 0;")
-    
-    echo "└────┴────────────────┴──────────────────────────┴─────────────────────┴─────────────────────┴────────┘"
+    fetch_repo_data "full"
+    render_table "Available Repositories:" "2|8|10|10|10|3"
 }
 
 # Launch binary
@@ -2067,35 +3136,536 @@ launch_binary() {
     esac
 }
 
+# Save build configuration to gitbuildfile
+save_gitbuildfile() {
+    local repo_id="$1"
+    
+    # Get repository information
+    local repo_info
+    repo_info=$(sqlite3 "$DB_FILE" "SELECT name, url, build_type, build_file_path, binary_path FROM repositories WHERE id = $repo_id;")
+    
+    if [ -z "$repo_info" ]; then
+        error "Repository ID $repo_id not found"
+        return 1
+    fi
+    
+    local name url build_type build_file_path binary_path
+    name=$(echo "$repo_info" | cut -d'|' -f1)
+    url=$(echo "$repo_info" | cut -d'|' -f2)
+    build_type=$(echo "$repo_info" | cut -d'|' -f3)
+    build_file_path=$(echo "$repo_info" | cut -d'|' -f4)
+    binary_path=$(echo "$repo_info" | cut -d'|' -f5)
+    
+    # Get build configuration
+    local build_config
+    build_config=$(get_build_config "$repo_id")
+    local configure_flags make_flags cmake_flags dependencies
+    IFS='|' read -r configure_flags make_flags cmake_flags dependencies <<< "$build_config"
+    
+    # Get notes
+    local notes
+    notes=$(sqlite3 "$DB_FILE" "SELECT notes FROM repository_notes WHERE repo_id = $repo_id;" || echo "")
+    
+    echo -e "\n${BLUE}Saving gitbuildfile for $name${NC}"
+    
+    # Check if repository exists locally
+    local repo_dir="$SRC_DIR/$name"
+    if [ ! -d "$repo_dir" ]; then
+        echo -e "${YELLOW}Repository not found locally at $repo_dir${NC}"
+        echo "Would you like to clone it first?"
+        read -rp "Clone repository? (y/N): " clone_choice
+        if [[ $clone_choice =~ ^[Yy]$ ]]; then
+            echo "Cloning repository..."
+            if ! git clone "$url" "$repo_dir"; then
+                error "Failed to clone repository"
+                return 1
+            fi
+        else
+            echo -e "${YELLOW}Saving gitbuildfile to current directory instead${NC}"
+            repo_dir="."
+        fi
+    fi
+    
+    # Create gitbuildfile content
+    local gitbuildfile_content="# GitBuilder build configuration file
+# Generated automatically by GitBuilder
+
+# Repository information
+REPO_NAME=\"$name\"
+REPO_URL=\"$url\"
+
+# Build method (cmake, autotools, make, etc.)
+BUILD_METHOD=\"$build_type\"
+
+# Space-separated list of dependencies
+DEPENDENCIES=\"$dependencies\"
+
+# Path to the build file (relative to repo root or absolute)
+BUILD_FILE=\"$build_file_path\"
+
+# Configure flags for autotools/cmake
+CONFIGURE_FLAGS=\"$configure_flags\"
+
+# Make flags
+MAKE_FLAGS=\"$make_flags\"
+
+# CMake flags
+CMAKE_FLAGS=\"$cmake_flags\"
+
+# Path to the compiled binary (relative to repo root or absolute)
+BINARY_PATH=\"$binary_path\"
+
+# Repository notes (displayed after build)
+NOTES=\"$notes\"
+"
+    
+    # Write gitbuildfile
+    local gitbuildfile_path="$repo_dir/gitbuildfile"
+    local gitbuildfiles_copy="$GITBUILDFILES_DIR/gitbuildfile-$name"
+    
+    # Check if either file exists and prompt once for overwrite
+    local files_exist=false
+    if [ -f "$gitbuildfile_path" ]; then
+        echo -e "${YELLOW}gitbuildfile already exists at: $gitbuildfile_path${NC}"
+        files_exist=true
+    fi
+    if [ -f "$gitbuildfiles_copy" ]; then
+        echo -e "${YELLOW}Backup copy already exists at: $gitbuildfiles_copy${NC}"
+        files_exist=true
+    fi
+    
+    if [ "$files_exist" = true ]; then
+        read -rp "Overwrite existing file(s)? (y/N): " overwrite_choice
+        if [[ ! "$overwrite_choice" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Save cancelled${NC}"
+            read -rp "Press Enter to continue..."
+            return 0
+        fi
+    fi
+    
+    # Use >| to force overwrite even with noclobber set
+    echo "$gitbuildfile_content" >| "$gitbuildfile_path"
+    
+    if [ $? -eq 0 ]; then
+        success "gitbuildfile saved to $gitbuildfile_path" wait
+        
+        # Also save a copy to gitbuildfiles directory
+        cp "$gitbuildfile_path" "$gitbuildfiles_copy" 2>/dev/null
+        echo -e "${CYAN}Copy saved to: $gitbuildfiles_copy${NC}"
+    else
+        error "Failed to save gitbuildfile"
+        return 1
+    fi
+}
+
+# Import gitbuildfile from gitbuildfiles directory
+import_gitbuildfile() {
+    echo -e "\n${BLUE}Import gitbuildfile${NC}"
+    echo -e "Gitbuildfiles directory: ${CYAN}$GITBUILDFILES_DIR${NC}\n"
+    
+    # Check if there are any gitbuildfiles
+    local file_count
+    file_count=$(find "$GITBUILDFILES_DIR" -maxdepth 1 -type f -name "gitbuildfile*" 2>/dev/null | wc -l)
+    
+    if [ "$file_count" -eq 0 ]; then
+        echo -e "${YELLOW}No gitbuildfiles found in $GITBUILDFILES_DIR${NC}"
+        echo -e "You can:"
+        echo -e "  1) Save a gitbuildfile from an existing repository (menu option 8)"
+        echo -e "  2) Manually place gitbuildfile files in: $GITBUILDFILES_DIR"
+        echo -e "\nPress any key to continue..."
+        read -r -n 1
+        return 1
+    fi
+    
+    # Use file browser to select a gitbuildfile
+    printf "\033c"
+    file_browser "$GITBUILDFILES_DIR" "gitbuildfile"
+    local browse_status=$?
+    printf "\033c"
+    
+    if [ $browse_status -ne 0 ]; then
+        echo -e "${YELLOW}Import cancelled${NC}"
+        sleep 1
+        return 1
+    fi
+    
+    # Get selected file
+    local selected_file
+    selected_file=$(cat /tmp/gitbuilder_selected_file 2>/dev/null)
+    
+    if [ -z "$selected_file" ] || [ ! -f "$selected_file" ]; then
+        error "No file selected"
+        return 1
+    fi
+    
+    echo -e "${BLUE}Importing: $selected_file${NC}\n"
+    
+    # Parse the gitbuildfile
+    local repo_name="" build_method="" dependencies="" build_file=""
+    local configure_flags="" make_flags="" cmake_flags="" binary_path="" notes=""
+    local repo_url=""
+    
+    while IFS='=' read -r key value; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        
+        # Remove quotes from value
+        value="${value#\"}"
+        value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
+        
+        case "$key" in
+            REPO_NAME) repo_name="$value" ;;
+            REPO_URL) repo_url="$value" ;;
+            BUILD_METHOD) build_method="$value" ;;
+            DEPENDENCIES) dependencies="$value" ;;
+            BUILD_FILE) build_file="$value" ;;
+            CONFIGURE_FLAGS) configure_flags="$value" ;;
+            MAKE_FLAGS) make_flags="$value" ;;
+            CMAKE_FLAGS) cmake_flags="$value" ;;
+            BINARY_PATH) binary_path="$value" ;;
+            NOTES) notes="$value" ;;
+        esac
+    done < "$selected_file"
+    
+    # Display parsed information
+    echo -e "${CYAN}Parsed gitbuildfile:${NC}"
+    echo -e "  Repository name: ${GREEN}$repo_name${NC}"
+    [ -n "$repo_url" ] && echo -e "  Repository URL:  ${GREEN}$repo_url${NC}"
+    echo -e "  Build method:    ${GREEN}$build_method${NC}"
+    echo -e "  Dependencies:    ${GREEN}$dependencies${NC}"
+    echo -e "  Build file:      ${GREEN}$build_file${NC}"
+    echo -e "  Configure flags: ${GREEN}$configure_flags${NC}"
+    echo -e "  Make flags:      ${GREEN}$make_flags${NC}"
+    echo -e "  CMake flags:     ${GREEN}$cmake_flags${NC}"
+    echo -e "  Binary path:     ${GREEN}$binary_path${NC}"
+    [ -n "$notes" ] && echo -e "  Notes:           ${GREEN}$notes${NC}"
+    echo
+    
+    # Check if repository already exists
+    local existing_id
+    existing_id=$(sqlite3 "$DB_FILE" "SELECT id FROM repositories WHERE name = '$repo_name' LIMIT 1;" 2>/dev/null)
+    
+    if [ -n "$existing_id" ]; then
+        echo -e "${YELLOW}Repository '$repo_name' already exists (ID: $existing_id)${NC}"
+        read -rp "Update existing repository with this configuration? (y/N): " update_choice
+        
+        if [[ ! "$update_choice" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Import cancelled${NC}"
+            sleep 1
+            return 1
+        fi
+        
+        # Update existing repository
+        sqlite3 "$DB_FILE" "UPDATE repositories SET build_type = '$build_method', build_file_path = '$build_file', binary_path = '$binary_path' WHERE id = $existing_id;"
+        
+        # Update build config
+        update_build_config "$existing_id" "configure_flags" "$configure_flags"
+        update_build_config "$existing_id" "make_flags" "$make_flags"
+        update_build_config "$existing_id" "cmake_flags" "$cmake_flags"
+        update_build_config "$existing_id" "dependencies" "$dependencies"
+        
+        # Update notes if provided
+        if [ -n "$notes" ]; then
+            sqlite3 "$DB_FILE" "INSERT OR REPLACE INTO repository_notes (repo_id, notes) VALUES ($existing_id, '$notes');"
+        fi
+        
+        success "Repository '$repo_name' updated with imported configuration" wait
+    else
+        # Need URL for new repository
+        if [ -z "$repo_url" ]; then
+            echo -e "${YELLOW}No repository URL found in gitbuildfile${NC}"
+            read -rp "Enter GitHub repository URL: " repo_url
+            
+            if [ -z "$repo_url" ]; then
+                error "URL is required to add a new repository"
+                return 1
+            fi
+            
+            if ! validate_github_url "$repo_url"; then
+                return 1
+            fi
+        fi
+        
+        read -rp "Add this as a new repository? (Y/n): " add_choice
+        
+        if [[ "$add_choice" =~ ^[Nn]$ ]]; then
+            echo -e "${YELLOW}Import cancelled${NC}"
+            sleep 1
+            return 1
+        fi
+        
+        # Add new repository
+        echo -e "\n${BLUE}Fetching repository information...${NC}"
+        local commit_date
+        commit_date=$(get_last_commit_date "$repo_url")
+        
+        # Insert repository first to get the ID
+        sqlite3 "$DB_FILE" "INSERT INTO repositories (name, url, last_commit, build_type, build_file_path, binary_path) VALUES ('$repo_name', '$repo_url', '$commit_date', '$build_method', '$build_file', '$binary_path');"
+        
+        # Get the new repository ID
+        local new_id
+        new_id=$(sqlite3 "$DB_FILE" "SELECT last_insert_rowid();")
+        
+        # Build remaining SQL statements for transaction
+        local sql="INSERT INTO build_configs (repo_id, configure_flags, make_flags, cmake_flags, dependencies) VALUES ($new_id, '$configure_flags', '$make_flags', '$cmake_flags', '$dependencies');"
+        
+        # Add notes if provided
+        if [ -n "$notes" ]; then
+            sql+=" INSERT INTO repository_notes (repo_id, notes) VALUES ($new_id, '$notes');"
+        fi
+        
+        # Execute remaining inserts in a single transaction
+        if db_transaction "$sql"; then
+            success "Repository '$repo_name' added from gitbuildfile (ID: $new_id)" wait
+        else
+            error "Failed to import repository"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# Repository notes menu
+repository_notes_menu() {
+    while true; do
+        show_standard_layout "Repository Notes"
+        local current_editor
+        current_editor=$(get_editor)
+        
+        echo -e "Editor: ${GREEN}${current_editor:-none}${NC}"
+        echo ""
+        echo "1) Read notes"
+        echo "2) Edit notes"
+        echo "3) Change editor"
+        
+        echo ""
+        read_with_esc "Select option: " choice
+        local esc_status=$?
+        
+        # Handle Esc key - return to main menu
+        if [ $esc_status -eq 27 ]; then
+            return 0
+        fi
+        
+        # Handle help key
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+        esac
+        
+        # Handle menu options
+        case $choice in
+            1)
+                read_repository_notes
+                ;;
+            2)
+                edit_repository_notes
+                ;;
+            3)
+                change_editor
+                ;;
+            *) 
+                echo -e "${RED}Invalid option${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# Read repository notes
+read_repository_notes() {
+    read -rp "Enter repository ID: " repo_id
+    
+    # Validate ID
+    if [[ -z "$repo_id" ]] || ! [[ "$repo_id" =~ ^[0-9]+$ ]]; then
+        error "Invalid repository ID: $repo_id"
+        return 1
+    fi
+    
+    # Get repository name
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;" || echo "")
+    
+    if [ -z "$repo_name" ]; then
+        error "Repository ID $repo_id not found"
+        return 1
+    fi
+    
+    # Get notes
+    local notes
+    notes=$(sqlite3 "$DB_FILE" "SELECT notes FROM repository_notes WHERE repo_id = $repo_id;" || echo "")
+    
+    echo -e "\n${BLUE}Notes for $repo_name (ID: $repo_id)${NC}"
+    echo "=========================================="
+    
+    if [ -z "$notes" ]; then
+        echo -e "${YELLOW}No notes found for this repository${NC}"
+    else
+        echo "$notes"
+    fi
+    
+    echo "=========================================="
+    echo -e "\nPress any key to continue..."
+    read -r -n 1
+}
+
+# Edit repository notes
+edit_repository_notes() {
+    read -rp "Enter repository ID: " repo_id
+    
+    # Validate ID
+    if [[ -z "$repo_id" ]] || ! [[ "$repo_id" =~ ^[0-9]+$ ]]; then
+        error "Invalid repository ID: $repo_id"
+        return 1
+    fi
+    
+    # Get repository name
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;" || echo "")
+    
+    if [ -z "$repo_name" ]; then
+        error "Repository ID $repo_id not found"
+        return 1
+    fi
+    
+    # Get current notes
+    local current_notes
+    current_notes=$(sqlite3 "$DB_FILE" "SELECT notes FROM repository_notes WHERE repo_id = $repo_id;" || echo "")
+    
+    echo -e "\n${BLUE}Editing notes for $repo_name (ID: $repo_id)${NC}"
+    echo "Current notes:"
+    echo "=========================================="
+    if [ -z "$current_notes" ]; then
+        echo -e "${YELLOW}No current notes${NC}"
+    else
+        echo "$current_notes"
+    fi
+    echo "=========================================="
+    
+    # Create temporary file for editing
+    local temp_file
+    temp_file=$(mktemp --suffix=.txt)
+    # Use >| to force write even with noclobber set
+    if [ -n "$current_notes" ]; then
+        echo "$current_notes" >| "$temp_file"
+    fi
+    
+    # Get preferred editor
+    local editor
+    editor=$(get_editor)
+    
+    if [ -n "$editor" ]; then
+        echo -e "\nOpening notes in ${GREEN}$editor${NC}..."
+        sleep 0.5
+        "$editor" "$temp_file"
+    else
+        echo -e "${YELLOW}No text editor found. Using basic input mode.${NC}"
+        echo "Enter notes line by line. Press Enter on empty line to finish:"
+        local new_notes=""
+        local line
+        while true; do
+            read -rp "> " line
+            if [ -z "$line" ]; then
+                break
+            fi
+            new_notes="$new_notes$line\n"
+        done
+        echo -e "$new_notes" >| "$temp_file"
+    fi
+    
+    # Read the edited notes
+    local new_notes
+    new_notes=$(cat "$temp_file")
+    rm -f "$temp_file"
+    
+    # Update database
+    local escaped_notes
+    escaped_notes=$(sql_escape "$new_notes")
+    
+    if [ -z "$new_notes" ]; then
+        # Delete notes if empty
+        sqlite3 "$DB_FILE" "DELETE FROM repository_notes WHERE repo_id = $repo_id;"
+        success "Notes cleared for $repo_name" wait
+    else
+        # Update or insert notes
+        sqlite3 "$DB_FILE" "INSERT OR REPLACE INTO repository_notes (repo_id, notes) VALUES ($repo_id, '$escaped_notes');"
+        success "Notes updated for $repo_name" wait
+    fi
+}
+
 # Main menu
 main_menu() {
     while true; do
-        clear
-        echo -e "\n${YELLOW}GitHub Package Manager${NC}"
+        show_standard_layout "Main Menu"
+        echo -e "${CYAN}Repository Management${NC}"
         echo "1) Add repository"
         echo "2) Edit repository"
         echo "3) Remove repository"
-        echo "4) Download and build"
-        echo "5) See/edit build details"
-        echo "6) Launch binary"
-        echo "7) Update all repositories"
-        echo "8) Exit"
+        echo "4) Search repositories"
+        echo ""
+        echo -e "${CYAN}Build Operations${NC}"
+        echo "5) Download and build"
+        echo "6) Build queue"
+        echo "7) Build profiles"
+        echo "8) Build history"
+        echo ""
+        echo -e "${CYAN}Repository Details${NC}"
+        echo "9) See/edit build details"
+        echo "10) Launch binary"
+        echo "11) Dependencies"
+        echo "12) Repository notes"
+        echo ""
+        echo -e "${CYAN}Import/Export${NC}"
+        echo "13) Save gitbuildfile"
+        echo "14) Import gitbuildfile"
+        echo ""
+        echo -e "${CYAN}System${NC}"
+        echo "15) Refresh Git repository information"
+        echo "16) Settings"
         
-        show_repos
+        # Read input with timeout to catch Esc key
+        echo ""
+        read_with_esc "Select option: " choice
+        local esc_status=$?
         
-        read -rp "Select an option: " choice
+        # Handle Esc key - exit from main menu
+        if [ $esc_status -eq 27 ]; then
+            echo -e "\n${YELLOW}Exiting GitBuilder...${NC}"
+            exit 0
+        fi
+        
+        # Handle help key
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+        esac
+        
+        # Handle menu options
         case $choice in
             1) add_repo || continue ;;
             2)
                 read -rp "Enter repository ID to edit: " id
                 edit_repo "$id" || continue
                 ;;
-            3) remove_repo || continue ;;
+            3) 
+                auto_backup "remove_repo"
+                remove_repo || continue 
+                ;;
             4)
+                read -rp "Enter search term: " query
+                search_repos "$query"
+                read -rp "Press Enter to continue..."
+                ;;
+            5)
                 read -rp "Enter repository ID to build: " id
                 download_build "$id" || continue
                 ;;
-            5)
+            6) build_queue_menu ;;
+            7) build_profiles_menu ;;
+            8) build_history_menu ;;
+            9)
                 read -rp "Enter repository ID to view details: " id
                 # Validate that ID is provided and is a number
                 if [[ -z "$id" ]] || ! [[ "$id" =~ ^[0-9]+$ ]]; then
@@ -2105,17 +3675,22 @@ main_menu() {
                 fi
                 show_build_details "$id" || continue
                 ;;
-            6)
+            10)
                 read -rp "Enter repository ID to launch: " id
                 if launch_binary "$id"; then
                     echo -e "\nPress any key to continue..."
                     read -r -n 1
                 fi
                 ;;
-            7)
-                update_all_repos || continue
+            11) dependencies_menu ;;
+            12) repository_notes_menu || continue ;;
+            13)
+                read -rp "Enter repository ID to save gitbuildfile: " id
+                save_gitbuildfile "$id" || continue
                 ;;
-            8) exit 0 ;;
+            14) import_gitbuildfile || continue ;;
+            15) update_all_repos || continue ;;
+            16) settings_menu ;;
             *) 
                 echo -e "${RED}Invalid option${NC}"
                 sleep 1
@@ -2124,7 +3699,1134 @@ main_menu() {
     done
 }
 
+# Get console width
+get_console_width() {
+    tput cols 2>/dev/null || echo 80
+}
+
+# Display repository table in top pane (compact format with short dates)
+show_repository_table() {
+    fetch_repo_data "short"
+    render_table "Available Repositories:" "2|8|20|5|5|3"
+}
+
+# Read input with immediate Esc key detection
+read_with_esc() {
+	local prompt="$1"
+	local _out_var="${2:-}"
+	local input=""
+	local char
+	
+	echo -n "$prompt"
+	
+	# Read character by character; rely on the terminal's normal echo
+	while IFS= read -r -n1 char; do
+		# Check for Esc key (ASCII 27)
+		if [ "$char" = $'\e' ]; then
+			echo ""
+			return 27  # Return code for Esc
+		fi
+		
+		# Check for Enter key (read -n1 returns empty string for Enter)
+		if [ -z "$char" ]; then
+			echo ""  # Move to next line
+			# Return the input
+			if [ -n "$_out_var" ]; then
+				printf -v "$_out_var" '%s' "$input"
+			else
+				# Legacy style: echo input so callers using command substitution still work
+				echo "$input"
+			fi
+			return 0
+		fi
+		
+		# Handle backspace
+		if [ "$char" = $'\x7f' ] || [ "$char" = $'\b' ]; then
+			if [ -n "$input" ]; then
+				input="${input%?}"
+				# Erase one character visually
+				echo -ne "\b \b"
+			fi
+		else
+			input+="$char"
+			# No extra echo here; terminal already echoed the char
+		fi
+	done
+}
+
+# Display common key shortcuts
+show_common_keys() {
+    echo -e "${GRAY}Esc = Back/Exit | H = Help${NC}"
+}
+
+# Show help page
+show_help_page() {
+    clear
+    echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║${NC}              ${CYAN}GitBuilder v${VERSION} - Help${NC}                        ${YELLOW}║${NC}"
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${BLUE}Keyboard Shortcuts${NC}"
+    echo "  Esc     - Return to previous screen / Exit from main menu"
+    echo "  H       - Show this help page (from any screen)"
+    echo "  0-9     - Select menu options"
+    echo ""
+    echo -e "${BLUE}Main Menu Categories${NC}"
+    echo "  1-4     Repository Management (add, edit, remove, search)"
+    echo "  5-8     Build Operations (build, queue, profiles, history)"
+    echo "  9-12    Repository Details (details, launch, deps, notes)"
+    echo "  13-14   Import/Export (gitbuildfile save/import)"
+    echo "  15-16   System (refresh repos, settings)"
+    echo ""
+    echo -e "${BLUE}Build System Support${NC}"
+    echo "  - CMake, Autotools (configure), Make, Meson, Ninja"
+    echo "  - Gradle, Maven, Cargo (Rust), Go, npm/yarn"
+    echo "  - Custom gitbuildfile configurations"
+    echo ""
+    echo -e "${BLUE}Build Optimization${NC}"
+    echo "  - Parallel builds (auto-detected CPU cores)"
+    echo "  - ccache integration for faster rebuilds"
+    echo "  - RAM disk support for large projects"
+    echo "  - Debug symbol stripping for smaller binaries"
+    echo ""
+    echo -e "${BLUE}Data Storage${NC}"
+    echo "  Database:  ~/.local/share/gitbuilder/repos.db"
+    echo "  Config:    ~/.local/share/gitbuilder/config"
+    echo "  Sources:   ~/.local/share/gitbuilder/src/"
+    echo "  Backups:   ~/.local/share/gitbuilder/backups/"
+    echo ""
+    echo -e "${BLUE}Command Line Options${NC}"
+    echo "  -h, --help          Show help message"
+    echo "  -v, --version       Show version"
+    echo "  -l, --list          List all repositories"
+    echo "  -b, --build ID      Build specific repository"
+    echo "  --backup FILE       Backup database"
+    echo "  --restore FILE      Restore database"
+    echo "  --check-update      Check for updates"
+    echo ""
+    echo -e "${CYAN}GitHub: $GITHUB_REPO${NC}"
+    echo ""
+    echo -e "${GRAY}Press any key to return...${NC}"
+    read -r -n 1
+}
+
+# Standard layout for all screens
+show_standard_layout() {
+    local screen_name="${1:-}"
+    clear
+    echo -e "${YELLOW}GitBuilder v${VERSION}${NC}${screen_name:+ - ${CYAN}${screen_name}${NC}}"
+    show_common_keys
+    echo ""
+    show_repository_table
+    echo ""
+}
+
+# Repository update check (real loading screen)
+update_repository_info() {
+    echo -e "\n${YELLOW}GitHub Package Manager${NC}"
+    echo -e "\n${CYAN}Loading application...${NC}"
+    
+    # Simulate loading with progress
+    echo -n "Initializing components"
+    for i in {1..3}; do
+        echo -n "."
+        sleep 0.3
+    done
+    echo ""
+    
+    echo -e "\n${BLUE}Updating repository information...${NC}"
+    while IFS='|' read -r id name url last_commit; do
+        # If last_commit is empty or older than 1 day, update it
+        if [ -z "$last_commit" ] || [ "$(date -d "$last_commit" +%s 2>/dev/null || echo 0)" -lt "$(date -d "1 day ago" +%s)" ]; then
+            update_commit_date "$id" "$url"
+        fi
+    done < <(sqlite3 "$DB_FILE" "SELECT id, name, url, last_commit FROM repositories WHERE deleted = 0;")
+    
+    echo -e "\n${YELLOW}Launching main menu...${NC}"
+    sleep 0.3
+    clear
+}
+
+# =============================================================================
+# BACKUP AND RESTORE FUNCTIONS
+# =============================================================================
+
+# Create database backup
+backup_database() {
+    local backup_file="${1:-}"
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    
+    if [ -z "$backup_file" ]; then
+        backup_file="$BACKUP_DIR/gitbuilder_backup_$timestamp.sql"
+    fi
+    
+    # Ensure backup directory exists
+    mkdir -p "$(dirname "$backup_file")"
+    
+    echo -e "${BLUE}Creating database backup...${NC}"
+    
+    if sqlite3 "$DB_FILE" ".dump" > "$backup_file" 2>/dev/null; then
+        # Also backup config file
+        if [ -f "$CONFIG_FILE" ]; then
+            cp "$CONFIG_FILE" "${backup_file%.sql}.config"
+        fi
+        
+        # Compress if file is large
+        local size
+        size=$(stat -c%s "$backup_file" 2>/dev/null || echo 0)
+        if [ "$size" -gt 1048576 ]; then  # > 1MB
+            gzip "$backup_file"
+            backup_file="${backup_file}.gz"
+        fi
+        
+        chmod 600 "$backup_file"
+        success "Backup saved to: $backup_file" wait
+        return 0
+    else
+        error "Failed to create backup"
+        return 1
+    fi
+}
+
+# Restore database from backup
+restore_database() {
+    local backup_file="${1:-}"
+    
+    if [ -z "$backup_file" ]; then
+        # List available backups
+        echo -e "${BLUE}Available backups:${NC}"
+        local backups=()
+        while IFS= read -r -d '' file; do
+            backups+=("$file")
+        done < <(find "$BACKUP_DIR" -name "*.sql*" -print0 2>/dev/null | sort -z -r)
+        
+        if [ ${#backups[@]} -eq 0 ]; then
+            echo -e "${YELLOW}No backups found in $BACKUP_DIR${NC}"
+            return 1
+        fi
+        
+        local i=1
+        for backup in "${backups[@]}"; do
+            local size
+            size=$(du -h "$backup" 2>/dev/null | cut -f1)
+            local date
+            date=$(stat -c%y "$backup" 2>/dev/null | cut -d' ' -f1)
+            echo "$i) $(basename "$backup") ($size, $date)"
+            ((i++))
+        done
+        
+        read -rp "Select backup to restore (1-${#backups[@]}): " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#backups[@]}" ]; then
+            backup_file="${backups[$((choice-1))]}"
+        else
+            error "Invalid selection"
+            return 1
+        fi
+    fi
+    
+    if [ ! -f "$backup_file" ]; then
+        error "Backup file not found: $backup_file"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}WARNING: This will replace your current database!${NC}"
+    read -rp "Are you sure you want to restore from $(basename "$backup_file")? (y/N): " confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Restore cancelled${NC}"
+        return 1
+    fi
+    
+    # Create backup of current database first
+    echo -e "${BLUE}Backing up current database...${NC}"
+    backup_database "$BACKUP_DIR/pre_restore_$(date +%Y%m%d_%H%M%S).sql"
+    
+    # Handle compressed backups
+    local restore_file="$backup_file"
+    if [[ "$backup_file" == *.gz ]]; then
+        restore_file=$(mktemp)
+        gunzip -c "$backup_file" > "$restore_file"
+    fi
+    
+    # Restore database
+    echo -e "${BLUE}Restoring database...${NC}"
+    rm -f "$DB_FILE"
+    if sqlite3 "$DB_FILE" < "$restore_file"; then
+        # Restore config if available
+        local config_backup="${backup_file%.sql*}.config"
+        if [ -f "$config_backup" ]; then
+            cp "$config_backup" "$CONFIG_FILE"
+            load_config
+        fi
+        
+        [ "$restore_file" != "$backup_file" ] && rm -f "$restore_file"
+        success "Database restored successfully" wait
+        return 0
+    else
+        [ "$restore_file" != "$backup_file" ] && rm -f "$restore_file"
+        error "Failed to restore database"
+        return 1
+    fi
+}
+
+# Auto-backup before destructive operations
+auto_backup() {
+    local reason="${1:-auto}"
+    local backup_file="$BACKUP_DIR/auto_${reason}_$(date +%Y%m%d_%H%M%S).sql"
+    sqlite3 "$DB_FILE" ".dump" > "$backup_file" 2>/dev/null
+    chmod 600 "$backup_file"
+    
+    # Keep only last 10 auto-backups
+    find "$BACKUP_DIR" -name "auto_*.sql" -type f | sort -r | tail -n +11 | xargs -r rm -f
+}
+
+# =============================================================================
+# BUILD PROFILES FUNCTIONS
+# =============================================================================
+
+# Create a new build profile
+create_build_profile() {
+    echo -e "\n${BLUE}Create Build Profile${NC}"
+    
+    local name description configure_flags make_flags cmake_flags strip_debug use_ramdisk
+    
+    read -rp "Profile name: " name
+    if [ -z "$name" ]; then
+        error "Profile name is required"
+        return 1
+    fi
+    
+    # Check if profile already exists
+    local existing
+    existing=$(sqlite3 "$DB_FILE" "SELECT id FROM build_profiles WHERE name = '$(sql_escape "$name")';")
+    if [ -n "$existing" ]; then
+        error "Profile '$name' already exists"
+        return 1
+    fi
+    
+    read -rp "Description: " description
+    read -rp "Configure flags: " configure_flags
+    read -rp "Make flags: " make_flags
+    read -rp "CMake flags: " cmake_flags
+    
+    read -rp "Strip debug symbols? (y/N): " strip_choice
+    strip_debug=0
+    [[ "$strip_choice" =~ ^[Yy]$ ]] && strip_debug=1
+    
+    read -rp "Use RAM disk? (y/N): " ramdisk_choice
+    use_ramdisk=0
+    [[ "$ramdisk_choice" =~ ^[Yy]$ ]] && use_ramdisk=1
+    
+    sqlite3 "$DB_FILE" "INSERT INTO build_profiles (name, description, configure_flags, make_flags, cmake_flags, strip_debug, use_ramdisk) 
+        VALUES ('$(sql_escape "$name")', '$(sql_escape "$description")', '$(sql_escape "$configure_flags")', 
+                '$(sql_escape "$make_flags")', '$(sql_escape "$cmake_flags")', $strip_debug, $use_ramdisk);"
+    
+    success "Build profile '$name' created" wait
+}
+
+# List build profiles
+list_build_profiles() {
+    echo -e "\n${BLUE}Build Profiles${NC}"
+    echo "============================================"
+    
+    local profiles
+    profiles=$(sqlite3 "$DB_FILE" "SELECT id, name, description FROM build_profiles ORDER BY name;")
+    
+    if [ -z "$profiles" ]; then
+        echo -e "${YELLOW}No build profiles defined${NC}"
+        echo -e "Use 'Create profile' to add one."
+        return 1
+    fi
+    
+    while IFS='|' read -r id name desc; do
+        echo -e "${GREEN}[$id]${NC} $name"
+        [ -n "$desc" ] && echo -e "    ${GRAY}$desc${NC}"
+    done <<< "$profiles"
+    
+    echo "============================================"
+}
+
+# Apply profile to repository
+apply_profile_to_repo() {
+    local repo_id="$1"
+    
+    list_build_profiles || return 1
+    
+    read -rp "Enter profile ID to apply: " profile_id
+    
+    if ! is_valid_id "$profile_id"; then
+        error "Invalid profile ID"
+        return 1
+    fi
+    
+    local profile
+    profile=$(sqlite3 "$DB_FILE" "SELECT configure_flags, make_flags, cmake_flags, strip_debug, use_ramdisk FROM build_profiles WHERE id = $profile_id;")
+    
+    if [ -z "$profile" ]; then
+        error "Profile not found"
+        return 1
+    fi
+    
+    IFS='|' read -r configure_flags make_flags cmake_flags strip_debug use_ramdisk <<< "$profile"
+    
+    sqlite3 "$DB_FILE" "UPDATE build_configs SET 
+        configure_flags = '$(sql_escape "$configure_flags")',
+        make_flags = '$(sql_escape "$make_flags")',
+        cmake_flags = '$(sql_escape "$cmake_flags")',
+        strip_debug = $strip_debug,
+        use_ramdisk = $use_ramdisk
+        WHERE repo_id = $repo_id;"
+    
+    success "Profile applied to repository" wait
+}
+
+# Build profiles menu
+build_profiles_menu() {
+    while true; do
+        show_standard_layout "Build Profiles"
+        echo "1) List profiles"
+        echo "2) Create profile"
+        echo "3) Delete profile"
+        echo "4) Apply profile to repository"
+        echo "5) Save repository config as profile"
+        
+        echo ""
+        read_with_esc "Select option: " choice
+        [ $? -eq 27 ] && return 0
+        
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+            1) list_build_profiles; read -rp "Press Enter to continue..." ;;
+            2) create_build_profile ;;
+            3) 
+                list_build_profiles
+                read -rp "Enter profile ID to delete: " pid
+                if is_valid_id "$pid"; then
+                    auto_backup "profile_delete"
+                    sqlite3 "$DB_FILE" "DELETE FROM build_profiles WHERE id = $pid;"
+                    success "Profile deleted"
+                fi
+                ;;
+            4)
+                read -rp "Enter repository ID: " rid
+                apply_profile_to_repo "$rid"
+                ;;
+            5)
+                read -rp "Enter repository ID: " rid
+                read -rp "Enter profile name: " pname
+                if [ -n "$pname" ] && is_valid_id "$rid"; then
+                    local config
+                    config=$(sqlite3 "$DB_FILE" "SELECT configure_flags, make_flags, cmake_flags, strip_debug, use_ramdisk FROM build_configs WHERE repo_id = $rid;")
+                    if [ -n "$config" ]; then
+                        IFS='|' read -r cf mf cmf sd ur <<< "$config"
+                        sqlite3 "$DB_FILE" "INSERT INTO build_profiles (name, configure_flags, make_flags, cmake_flags, strip_debug, use_ramdisk) 
+                            VALUES ('$(sql_escape "$pname")', '$(sql_escape "$cf")', '$(sql_escape "$mf")', '$(sql_escape "$cmf")', $sd, $ur);"
+                        success "Profile '$pname' created from repository config" wait
+                    fi
+                fi
+                ;;
+            *) echo -e "${RED}Invalid option${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+# BUILD QUEUE FUNCTIONS
+# =============================================================================
+
+# Add repository to build queue
+add_to_queue() {
+    local repo_id="$1"
+    local profile_id="${2:-}"
+    local priority="${3:-0}"
+    
+    if ! is_valid_id "$repo_id"; then
+        error "Invalid repository ID"
+        return 1
+    fi
+    
+    # Check if already in queue
+    local existing
+    existing=$(sqlite3 "$DB_FILE" "SELECT id FROM build_queue WHERE repo_id = $repo_id AND status = 'pending';")
+    if [ -n "$existing" ]; then
+        echo -e "${YELLOW}Repository already in queue${NC}"
+        return 1
+    fi
+    
+    local profile_clause="NULL"
+    [ -n "$profile_id" ] && profile_clause="$profile_id"
+    
+    sqlite3 "$DB_FILE" "INSERT INTO build_queue (repo_id, profile_id, priority) VALUES ($repo_id, $profile_clause, $priority);"
+    success "Added to build queue"
+}
+
+# Show build queue
+show_build_queue() {
+    echo -e "\n${BLUE}Build Queue${NC}"
+    echo "============================================"
+    
+    local queue
+    queue=$(sqlite3 "$DB_FILE" "SELECT q.id, r.name, q.status, q.priority, q.added_at, p.name 
+        FROM build_queue q 
+        JOIN repositories r ON q.repo_id = r.id 
+        LEFT JOIN build_profiles p ON q.profile_id = p.id 
+        ORDER BY q.priority DESC, q.added_at ASC;")
+    
+    if [ -z "$queue" ]; then
+        echo -e "${YELLOW}Build queue is empty${NC}"
+        return 1
+    fi
+    
+    printf "%-4s %-20s %-10s %-8s %-12s %s\n" "ID" "Repository" "Status" "Priority" "Added" "Profile"
+    echo "--------------------------------------------------------------------"
+    
+    while IFS='|' read -r id name status priority added profile; do
+        local status_color="$YELLOW"
+        [ "$status" = "completed" ] && status_color="$GREEN"
+        [ "$status" = "failed" ] && status_color="$RED"
+        [ "$status" = "building" ] && status_color="$CYAN"
+        
+        printf "%-4s %-20s ${status_color}%-10s${NC} %-8s %-12s %s\n" \
+            "$id" "${name:0:20}" "$status" "$priority" "${added:0:10}" "${profile:-default}"
+    done <<< "$queue"
+    
+    echo "============================================"
+}
+
+# Process build queue
+process_build_queue() {
+    echo -e "\n${BLUE}Processing Build Queue${NC}"
+    
+    local pending
+    pending=$(sqlite3 "$DB_FILE" "SELECT q.id, q.repo_id, q.profile_id FROM build_queue 
+        WHERE q.status = 'pending' ORDER BY q.priority DESC, q.added_at ASC;")
+    
+    if [ -z "$pending" ]; then
+        echo -e "${YELLOW}No pending builds in queue${NC}"
+        return 0
+    fi
+    
+    local total
+    total=$(echo "$pending" | wc -l)
+    local current=0
+    
+    while IFS='|' read -r queue_id repo_id profile_id; do
+        ((current++))
+        
+        local repo_name
+        repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;")
+        
+        echo -e "\n${CYAN}[$current/$total] Building: $repo_name${NC}"
+        
+        # Update status to building
+        sqlite3 "$DB_FILE" "UPDATE build_queue SET status = 'building', started_at = datetime('now') WHERE id = $queue_id;"
+        
+        # Apply profile if specified
+        if [ -n "$profile_id" ] && [ "$profile_id" != "NULL" ]; then
+            apply_profile_to_repo "$repo_id"
+        fi
+        
+        # Build
+        if download_build "$repo_id"; then
+            sqlite3 "$DB_FILE" "UPDATE build_queue SET status = 'completed' WHERE id = $queue_id;"
+            send_notification "Build Complete" "$repo_name built successfully"
+        else
+            sqlite3 "$DB_FILE" "UPDATE build_queue SET status = 'failed' WHERE id = $queue_id;"
+            send_notification "Build Failed" "$repo_name build failed"
+        fi
+    done <<< "$pending"
+    
+    success "Queue processing complete" wait
+}
+
+# Clear completed/failed from queue
+clear_queue() {
+    local status="${1:-all}"
+    
+    case "$status" in
+        completed) sqlite3 "$DB_FILE" "DELETE FROM build_queue WHERE status = 'completed';" ;;
+        failed) sqlite3 "$DB_FILE" "DELETE FROM build_queue WHERE status = 'failed';" ;;
+        pending) sqlite3 "$DB_FILE" "DELETE FROM build_queue WHERE status = 'pending';" ;;
+        all) sqlite3 "$DB_FILE" "DELETE FROM build_queue;" ;;
+    esac
+    
+    success "Queue cleared"
+}
+
+# Build queue menu
+build_queue_menu() {
+    while true; do
+        show_standard_layout "Build Queue"
+        show_build_queue
+        echo ""
+        echo "1) Add repository to queue"
+        echo "2) Process queue"
+        echo "3) Clear completed"
+        echo "4) Clear failed"
+        echo "5) Clear all"
+        
+        echo ""
+        read_with_esc "Select option: " choice
+        [ $? -eq 27 ] && return 0
+        
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+            1) 
+                read -rp "Enter repository ID: " rid
+                add_to_queue "$rid"
+                ;;
+            2) process_build_queue ;;
+            3) clear_queue "completed" ;;
+            4) clear_queue "failed" ;;
+            5) clear_queue "all" ;;
+            *) echo -e "${RED}Invalid option${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+# BUILD HISTORY FUNCTIONS
+# =============================================================================
+
+# Record build in history
+record_build_history() {
+    local repo_id="$1"
+    local success="$2"
+    local log_file="$3"
+    local start_time="$4"
+    local profile="${5:-}"
+    
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    sqlite3 "$DB_FILE" "INSERT INTO build_history (repo_id, finished_at, success, duration_seconds, log_file, build_profile) 
+        VALUES ($repo_id, datetime('now'), $success, $duration, '$(sql_escape "$log_file")', '$(sql_escape "$profile")');"
+}
+
+# Show build history
+show_build_history() {
+    local repo_id="${1:-}"
+    local limit="${2:-20}"
+    
+    echo -e "\n${BLUE}Build History${NC}"
+    echo "============================================"
+    
+    local where_clause=""
+    [ -n "$repo_id" ] && where_clause="WHERE h.repo_id = $repo_id"
+    
+    local history
+    history=$(sqlite3 "$DB_FILE" "SELECT h.id, r.name, h.started_at, h.success, h.duration_seconds 
+        FROM build_history h 
+        JOIN repositories r ON h.repo_id = r.id 
+        $where_clause
+        ORDER BY h.started_at DESC LIMIT $limit;")
+    
+    if [ -z "$history" ]; then
+        echo -e "${YELLOW}No build history found${NC}"
+        echo "============================================"
+        return 0
+    fi
+    
+    printf "%-4s %-20s %-20s %-8s %s\n" "ID" "Repository" "Date" "Status" "Duration"
+    echo "--------------------------------------------------------------------"
+    
+    while IFS='|' read -r id name started success duration; do
+        local status_text status_color
+        if [ "$success" = "0" ]; then
+            status_text="Success"
+            status_color="$GREEN"
+        else
+            status_text="Failed"
+            status_color="$RED"
+        fi
+        
+        local duration_text
+        if [ "$duration" -ge 3600 ]; then
+            duration_text="$((duration/3600))h $((duration%3600/60))m"
+        elif [ "$duration" -ge 60 ]; then
+            duration_text="$((duration/60))m $((duration%60))s"
+        else
+            duration_text="${duration}s"
+        fi
+        
+        printf "%-4s %-20s %-20s ${status_color}%-8s${NC} %s\n" \
+            "$id" "${name:0:20}" "${started:0:19}" "$status_text" "$duration_text"
+    done <<< "$history"
+    
+    echo "============================================"
+}
+
+# View build log from history
+view_build_log() {
+    local history_id="$1"
+    
+    local log_file
+    log_file=$(sqlite3 "$DB_FILE" "SELECT log_file FROM build_history WHERE id = $history_id;")
+    
+    if [ -z "$log_file" ] || [ ! -f "$log_file" ]; then
+        error "Build log not found"
+        return 1
+    fi
+    
+    less "$log_file"
+}
+
+# Build history menu
+build_history_menu() {
+    while true; do
+        show_standard_layout "Build History"
+        echo "1) Show all history"
+        echo "2) Show history for repository"
+        echo "3) View build log"
+        echo "4) Clear old history"
+        
+        echo ""
+        read_with_esc "Select option: " choice
+        [ $? -eq 27 ] && return 0
+        
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+            1) 
+                show_build_history
+                read -rp "Press Enter to continue..."
+                ;;
+            2)
+                read -rp "Enter repository ID: " rid
+                show_build_history "$rid"
+                read -rp "Press Enter to continue..."
+                ;;
+            3)
+                show_build_history
+                read -rp "Enter history ID to view log: " hid
+                view_build_log "$hid"
+                ;;
+            4)
+                read -rp "Delete history older than how many days? " days
+                if [[ "$days" =~ ^[0-9]+$ ]]; then
+                    sqlite3 "$DB_FILE" "DELETE FROM build_history WHERE started_at < datetime('now', '-$days days');"
+                    success "Old history cleared"
+                fi
+                ;;
+            *) echo -e "${RED}Invalid option${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+# DEPENDENCY GRAPH FUNCTIONS
+# =============================================================================
+
+# Add dependency between repositories
+add_repo_dependency() {
+    local repo_id="$1"
+    local depends_on="$2"
+    
+    if ! is_valid_id "$repo_id" || ! is_valid_id "$depends_on"; then
+        error "Invalid repository ID"
+        return 1
+    fi
+    
+    if [ "$repo_id" = "$depends_on" ]; then
+        error "Repository cannot depend on itself"
+        return 1
+    fi
+    
+    # Check for circular dependency
+    local circular
+    circular=$(sqlite3 "$DB_FILE" "WITH RECURSIVE deps(id) AS (
+        SELECT depends_on_repo_id FROM repo_dependencies WHERE repo_id = $depends_on
+        UNION
+        SELECT d.depends_on_repo_id FROM repo_dependencies d JOIN deps ON d.repo_id = deps.id
+    ) SELECT id FROM deps WHERE id = $repo_id;")
+    
+    if [ -n "$circular" ]; then
+        error "This would create a circular dependency"
+        return 1
+    fi
+    
+    sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO repo_dependencies (repo_id, depends_on_repo_id) VALUES ($repo_id, $depends_on);"
+    success "Dependency added"
+}
+
+# Show dependencies for a repository
+show_repo_dependencies() {
+    local repo_id="$1"
+    
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;")
+    
+    echo -e "\n${BLUE}Dependencies for: $repo_name${NC}"
+    echo "============================================"
+    
+    # Direct dependencies
+    echo -e "${CYAN}Depends on:${NC}"
+    local deps
+    deps=$(sqlite3 "$DB_FILE" "SELECT r.id, r.name FROM repositories r 
+        JOIN repo_dependencies d ON r.id = d.depends_on_repo_id 
+        WHERE d.repo_id = $repo_id;")
+    
+    if [ -z "$deps" ]; then
+        echo "  (none)"
+    else
+        while IFS='|' read -r id name; do
+            echo "  [$id] $name"
+        done <<< "$deps"
+    fi
+    
+    # Reverse dependencies
+    echo -e "\n${CYAN}Required by:${NC}"
+    local rdeps
+    rdeps=$(sqlite3 "$DB_FILE" "SELECT r.id, r.name FROM repositories r 
+        JOIN repo_dependencies d ON r.id = d.repo_id 
+        WHERE d.depends_on_repo_id = $repo_id;")
+    
+    if [ -z "$rdeps" ]; then
+        echo "  (none)"
+    else
+        while IFS='|' read -r id name; do
+            echo "  [$id] $name"
+        done <<< "$rdeps"
+    fi
+    
+    echo "============================================"
+}
+
+# Build with dependencies
+build_with_dependencies() {
+    local repo_id="$1"
+    
+    # Get all dependencies in order (topological sort)
+    local build_order
+    build_order=$(sqlite3 "$DB_FILE" "WITH RECURSIVE deps(id, level) AS (
+        SELECT depends_on_repo_id, 1 FROM repo_dependencies WHERE repo_id = $repo_id
+        UNION
+        SELECT d.depends_on_repo_id, deps.level + 1 
+        FROM repo_dependencies d JOIN deps ON d.repo_id = deps.id
+    ) SELECT DISTINCT id FROM deps ORDER BY level DESC;")
+    
+    if [ -n "$build_order" ]; then
+        echo -e "${BLUE}Building dependencies first...${NC}"
+        while read -r dep_id; do
+            local dep_name
+            dep_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $dep_id;")
+            echo -e "${CYAN}Building dependency: $dep_name${NC}"
+            download_build "$dep_id" || {
+                error "Failed to build dependency: $dep_name"
+                return 1
+            }
+        done <<< "$build_order"
+    fi
+    
+    # Now build the main repository
+    echo -e "${BLUE}Building main repository...${NC}"
+    download_build "$repo_id"
+}
+
+# Dependencies menu
+dependencies_menu() {
+    while true; do
+        show_standard_layout "Dependencies"
+        echo "1) Show dependencies for repository"
+        echo "2) Add dependency"
+        echo "3) Remove dependency"
+        echo "4) Build with dependencies"
+        
+        echo ""
+        read_with_esc "Select option: " choice
+        [ $? -eq 27 ] && return 0
+        
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+            1)
+                read -rp "Enter repository ID: " rid
+                show_repo_dependencies "$rid"
+                read -rp "Press Enter to continue..."
+                ;;
+            2)
+                read -rp "Repository ID: " rid
+                read -rp "Depends on repository ID: " did
+                add_repo_dependency "$rid" "$did"
+                ;;
+            3)
+                read -rp "Repository ID: " rid
+                read -rp "Remove dependency on ID: " did
+                sqlite3 "$DB_FILE" "DELETE FROM repo_dependencies WHERE repo_id = $rid AND depends_on_repo_id = $did;"
+                success "Dependency removed"
+                ;;
+            4)
+                read -rp "Enter repository ID: " rid
+                build_with_dependencies "$rid"
+                ;;
+            *) echo -e "${RED}Invalid option${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+# SEARCH AND FILTER FUNCTIONS
+# =============================================================================
+
+# Search repositories
+search_repos() {
+    local query="$1"
+    local escaped_query
+    escaped_query=$(sql_escape "$query")
+    
+    echo -e "\n${BLUE}Search Results for: $query${NC}"
+    echo "============================================"
+    
+    local results
+    results=$(sqlite3 "$DB_FILE" "SELECT id, name, url, build_success FROM repositories 
+        WHERE deleted = 0 AND (name LIKE '%$escaped_query%' OR url LIKE '%$escaped_query%')
+        ORDER BY name;")
+    
+    if [ -z "$results" ]; then
+        echo -e "${YELLOW}No repositories found matching '$query'${NC}"
+        return 1
+    fi
+    
+    while IFS='|' read -r id name url success; do
+        local status_icon="○"
+        [ "$success" = "0" ] && status_icon="${GREEN}●${NC}"
+        [ "$success" = "1" ] && status_icon="${RED}●${NC}"
+        
+        echo -e "$status_icon [$id] $name"
+        echo -e "   ${GRAY}$url${NC}"
+    done <<< "$results"
+    
+    echo "============================================"
+}
+
+# Filter repositories by status
+filter_repos_by_status() {
+    local status="$1"
+    
+    local where_clause
+    case "$status" in
+        success) where_clause="build_success = 0" ;;
+        failed) where_clause="build_success = 1" ;;
+        unbuilt) where_clause="build_success IS NULL" ;;
+        *) where_clause="1=1" ;;
+    esac
+    
+    echo -e "\n${BLUE}Repositories: $status${NC}"
+    echo "============================================"
+    
+    local results
+    results=$(sqlite3 "$DB_FILE" "SELECT id, name FROM repositories WHERE deleted = 0 AND $where_clause ORDER BY name;")
+    
+    if [ -z "$results" ]; then
+        echo -e "${YELLOW}No repositories found${NC}"
+        return 1
+    fi
+    
+    while IFS='|' read -r id name; do
+        echo "[$id] $name"
+    done <<< "$results"
+    
+    echo "============================================"
+}
+
+# =============================================================================
+# NOTIFICATION FUNCTIONS
+# =============================================================================
+
+# Send desktop notification
+send_notification() {
+    local title="$1"
+    local message="$2"
+    
+    # Check if notifications are enabled
+    if [ "${NOTIFICATIONS_ENABLED:-true}" != "true" ]; then
+        return 0
+    fi
+    
+    # Try different notification methods
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send "GitBuilder: $title" "$message" 2>/dev/null || true
+    elif command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"$message\" with title \"GitBuilder: $title\"" 2>/dev/null || true
+    fi
+}
+
+# =============================================================================
+# AUTO-UPDATE CHECK
+# =============================================================================
+
+# Check for GitBuilder updates
+check_for_updates() {
+    echo -e "${BLUE}Checking for updates...${NC}"
+    
+    local remote_version
+    remote_version=$(curl -s "https://raw.githubusercontent.com/vr51/GitBuilder/main/gitbuilder" 2>/dev/null | grep "^# Version:" | head -1 | awk '{print $3}')
+    
+    if [ -z "$remote_version" ]; then
+        echo -e "${YELLOW}Could not check for updates${NC}"
+        return 1
+    fi
+    
+    if [ "$remote_version" != "$VERSION" ]; then
+        echo -e "${GREEN}New version available: $remote_version (current: $VERSION)${NC}"
+        echo -e "Visit: $GITHUB_REPO"
+        return 0
+    else
+        echo -e "${GREEN}You are running the latest version ($VERSION)${NC}"
+        return 0
+    fi
+}
+
+# =============================================================================
+# THEME MENU
+# =============================================================================
+
+theme_menu() {
+    while true; do
+        show_standard_layout "Theme Settings"
+        echo -e "Current theme: ${GREEN}$THEME${NC}"
+        echo ""
+        echo "1) Default"
+        echo "2) Ocean"
+        echo "3) Forest"
+        echo "4) Mono (no colors)"
+        
+        echo ""
+        read_with_esc "Select theme: " choice
+        [ $? -eq 27 ] && return 0
+        
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+            1) THEME="default" ;;
+            2) THEME="ocean" ;;
+            3) THEME="forest" ;;
+            4) THEME="mono" ;;
+            *) echo -e "${RED}Invalid option${NC}"; sleep 1; continue ;;
+        esac
+        
+        apply_theme "$THEME"
+        save_config
+        success "Theme changed to: $THEME"
+        sleep 1
+    done
+}
+
+# =============================================================================
+# SETTINGS MENU
+# =============================================================================
+
+settings_menu() {
+    while true; do
+        show_standard_layout "Settings"
+        echo "1) Theme: $THEME"
+        echo "2) Notifications: ${NOTIFICATIONS_ENABLED:-true}"
+        echo "3) Auto-update check: every ${AUTO_UPDATE_CHECK_DAYS:-7} days"
+        echo "4) Check for updates now"
+        echo "5) Backup database"
+        echo "6) Restore database"
+        
+        echo ""
+        read_with_esc "Select option: " choice
+        [ $? -eq 27 ] && return 0
+        
+        case $choice in
+            [Hh]) show_help_page; continue ;;
+            1) theme_menu ;;
+            2)
+                if [ "${NOTIFICATIONS_ENABLED:-true}" = "true" ]; then
+                    NOTIFICATIONS_ENABLED="false"
+                else
+                    NOTIFICATIONS_ENABLED="true"
+                fi
+                save_config
+                success "Notifications: $NOTIFICATIONS_ENABLED"
+                sleep 1
+                ;;
+            3)
+                read -rp "Check for updates every how many days? (0 to disable): " days
+                if [[ "$days" =~ ^[0-9]+$ ]]; then
+                    AUTO_UPDATE_CHECK_DAYS="$days"
+                    save_config
+                    success "Auto-update check interval set to $days days"
+                fi
+                sleep 1
+                ;;
+            4) check_for_updates; read -rp "Press Enter to continue..." ;;
+            5) backup_database ;;
+            6) restore_database ;;
+            *) echo -e "${RED}Invalid option${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+# COMMAND LINE ARGUMENT HANDLING
+# =============================================================================
+
+# Parse remaining command line arguments (after help/version)
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -l|--list)
+                check_requirements
+                init_db
+                show_repos
+                exit 0
+                ;;
+            -b|--build)
+                shift
+                if [ -z "${1:-}" ]; then
+                    echo "Error: --build requires a repository ID"
+                    exit 1
+                fi
+                check_requirements
+                init_db
+                download_build "$1"
+                exit $?
+                ;;
+            -u|--update)
+                check_requirements
+                init_db
+                update_all_repos
+                exit 0
+                ;;
+            --backup)
+                shift
+                check_requirements
+                init_db
+                backup_database "${1:-}"
+                exit $?
+                ;;
+            --restore)
+                shift
+                if [ -z "${1:-}" ]; then
+                    echo "Error: --restore requires a backup file"
+                    exit 1
+                fi
+                check_requirements
+                init_db
+                restore_database "$1"
+                exit $?
+                ;;
+            --check-update)
+                check_for_updates
+                exit $?
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+# Parse command line arguments
+parse_args "$@"
+
 # Main execution
 check_requirements
 init_db
+update_repository_info
 main_menu
