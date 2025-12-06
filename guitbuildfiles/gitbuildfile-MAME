@@ -24,7 +24,7 @@ MAKE_FLAGS="REGENIE=1 TOOLS=1 NOWERROR=1 ARCHOPTS=-U_FORTIFY_SOURCE"
 CMAKE_FLAGS="REGENIE=1 TOOLS=1 NOWERROR=1 ARCHOPTS=-U_FORTIFY_SOURCE"
 
 # Path to the compiled binary (relative to repo root or absolute)
-BINARY_PATH="/home/lee/.local/share/gitbuilder/src/MAME/mame"
+BINARY_PATH="~/.local/share/gitbuilder/src/MAME/mame"
 
 # Repository notes (displayed after build)
 NOTES="Press INSERT to en/disable the MAME's system settings key while a system is running. Then use TAB to activate the system settings menu.
