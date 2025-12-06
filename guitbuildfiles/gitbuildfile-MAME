@@ -1,0 +1,39 @@
+# GitBuilder build configuration file
+# Generated automatically by GitBuilder
+
+# Repository information
+REPO_NAME="MAME"
+REPO_URL="https://github.com/mamedev/mame.git"
+
+# Build method (cmake, autotools, make, etc.)
+BUILD_METHOD=""
+
+# Space-separated list of dependencies
+DEPENDENCIES="|1|1"
+
+# Path to the build file (relative to repo root or absolute)
+BUILD_FILE=""
+
+# Configure flags for autotools/cmake
+CONFIGURE_FLAGS="REGENIE=1 TOOLS=1 NOWERROR=1 ARCHOPTS=-U_FORTIFY_SOURCE"
+
+# Make flags
+MAKE_FLAGS="REGENIE=1 TOOLS=1 NOWERROR=1 ARCHOPTS=-U_FORTIFY_SOURCE"
+
+# CMake flags
+CMAKE_FLAGS="REGENIE=1 TOOLS=1 NOWERROR=1 ARCHOPTS=-U_FORTIFY_SOURCE"
+
+# Path to the compiled binary (relative to repo root or absolute)
+BINARY_PATH="/home/lee/.local/share/gitbuilder/src/MAME/mame"
+
+# Repository notes (displayed after build)
+NOTES="Press INSERT to en/disable the MAME's system settings key while a system is running. Then use TAB to activate the system settings menu.
+
+MAME configuration files are usually stored in /home/<user name>/.mame/. Look for ___empty.ini or mame.ini and look for ui.ini.
+It is quicker to edit MAME software/game location URIs in the ini files than to do it in the MAME UI.
+
+Put your category index files (e.g. catlist.ini, catver.ini, genre.ini, genre_ows.ini, mature.ini and not_mature.ini) in /home/<user name>/.mame/UI/.
+These can be download from https://www.progettosnaps.net/catver/. They are zipped files. Put the unzipped files in in /home/<user name>/.mame/UI/.
+Remember to check/update the correct mame.ini or ___empty.ini with the correct location of your category files; or press TAB in the MAME UI and set their loaction in general settings.
+
+After configuring the locations of your ini, software and dat files, remember to hit the magnifying glass icon in the MAME UI; this tells MAME to audit your media/files."
