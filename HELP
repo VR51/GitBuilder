@@ -1,5 +1,5 @@
 ================================================================================
-                    GITBUILDER HELP - Version 2.0.0
+                    GITBUILDER HELP - Version 2.0.2
               GitHub Repository Manager and Build Automation Tool
 ================================================================================
 
@@ -111,8 +111,8 @@ Useful when you have many repositories in your database.
 [3] BUILD OPERATIONS
 ================================================================================
 
-DOWNLOAD AND BUILD (Option 5)
------------------------------
+BUILD AN EXISTING REPOSITORY (Option 5)
+---------------------------------------
 Clone a repository (if not already cloned) and build it.
 
 The build process:
@@ -121,11 +121,12 @@ The build process:
   3. Check and install dependencies
   4. Detect build system (CMake, Autotools, Make, etc.)
   5. Execute the build with parallel jobs
-  6. Find and register the built binary
-  7. Optionally create a desktop launcher
+  6. Show live progress: elapsed time, estimated remaining, log activity
+  7. Find and register the built binary (all binaries saved for later access)
+  8. Auto-update desktop launcher if exists, or offer to create one
 
-BUILD QUEUE (Option 6)
-----------------------
+SEE BUILD QUEUE (Option 6)
+--------------------------
 Queue multiple repositories for sequential building.
 
 Features:
@@ -161,18 +162,22 @@ SEE/EDIT BUILD DETAILS (Option 9)
 ---------------------------------
 Comprehensive view and edit screen for repository settings.
 
-Available options:
+Editable Options (1-17):
   1-5   Edit basic info (name, URL, build type, build file, binary path)
-  6-8   Edit build flags (configure, make, cmake)
-  9     Manage dependencies
-  10    Edit repository notes
-  11    View build log
-  12    Clean build directory
-  13    Create desktop launcher
-  14    Delete desktop launcher
-  15    Backup binary
-  16    Toggle debug stripping
-  17    Toggle RAM disk usage
+  6-10  Edit build flags and settings
+  11-17 Dependencies, notes, build file path, etc.
+
+Action Options (18-27):
+  18    Rebuild repository
+  19    Launch binary
+  20    Binary backups
+  21    Launch secondary binary (all binaries from this repo)
+  22    Create/Remove desktop launcher
+  23    View build errors
+  24    View build warnings
+  25    View missing dependencies
+  26    View full build log
+  27    Clear build log files
 
 Hotkeys in this screen:
   - H: Show help
@@ -388,6 +393,9 @@ Install ccache: sudo apt install ccache
 RAM DISK SUPPORT
 ----------------
 For faster builds on large projects, enable RAM disk:
+  - Dynamically allocates up to 75% of available RAM
+  - No hard cap - large projects like MAME can use what they need
+  - tmpfs only uses memory as files are written (not pre-allocated)
   - Minimum 2GB free RAM required
   - Source copied to RAM disk before building
   - Results copied back after build
@@ -425,8 +433,14 @@ The launcher will appear in your application menu after creation.
 You may need to log out and back in for it to appear.
 
 Managing Launchers:
-  - Create: Build details option 13
-  - Delete: Build details option 14
+  - Create/Remove: Build details option 22
+  - Auto-updated when binary path changes on rebuild
+
+Secondary Binaries:
+  - All binaries discovered during build are saved
+  - Access via Build details option 21
+  - Rescan for binaries if needed
+  - Launch any binary from the repository
 
 ================================================================================
 [11] DATA STORAGE & BACKUP
