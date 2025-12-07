@@ -1,0 +1,510 @@
+================================================================================
+                    GITBUILDER HELP - Version 2.0.0
+              GitHub Repository Manager and Build Automation Tool
+================================================================================
+
+QUICK REFERENCE
+===============
+
+Keyboard Shortcuts:
+  Esc     Return to previous screen / Exit from main menu
+  H       Show this help page (from any menu)
+  L       Quick launch a binary (main menu & build details)
+  G       Go to specific help section (enter section number)
+  0-9     Select menu options
+
+Command Line Usage:
+  gitbuilder              Start interactive mode
+  gitbuilder -h, --help   Show command line help
+  gitbuilder -v           Show version information
+  gitbuilder -l, --list   List all repositories
+  gitbuilder -b ID        Build repository with given ID
+  gitbuilder -u           Update all repository commit dates
+  gitbuilder --backup FILE    Backup database to file
+  gitbuilder --restore FILE   Restore database from file
+  gitbuilder --check-update   Check for GitBuilder updates
+
+Environment Variables:
+  GITBUILDER_JOBS   Number of parallel build jobs (default: auto-detect)
+  EDITOR            Preferred text editor for notes
+
+================================================================================
+                           HELP SECTIONS INDEX
+================================================================================
+
+[1]  Main Menu Overview
+[2]  Repository Management
+[3]  Build Operations
+[4]  Repository Details
+[5]  Import/Export (gitbuildfile)
+[6]  System Settings
+[7]  File Browser
+[8]  Build System Support
+[9]  Build Optimization
+[10] Desktop Launchers
+[11] Data Storage & Backup
+[12] Troubleshooting
+
+================================================================================
+[1] MAIN MENU OVERVIEW
+================================================================================
+
+The main menu is organized into categories for easy navigation:
+
+Repository Management (1-4):
+  Add, edit, remove, and search repositories in your database.
+
+Build Operations (5-8):
+  Download and build repositories, manage build queues, profiles, and history.
+
+Repository Details (9-12):
+  View/edit build details, launch binaries, manage dependencies and notes.
+
+Import/Export (13-15):
+  Save and import gitbuildfile configurations for sharing build settings.
+
+System (16-18):
+  Refresh repository info, access settings, install GitBuilder launcher.
+
+Navigation:
+  - Type a number and press Enter to select an option
+  - Press Esc to exit GitBuilder
+  - Press H for help, L for quick launch, G for specific help section
+
+================================================================================
+[2] REPOSITORY MANAGEMENT
+================================================================================
+
+ADD A REPOSITORY (Option 1)
+---------------------------
+Add a new GitHub repository to GitBuilder's database.
+
+Required information:
+  - Repository name (e.g., "zesarux")
+  - GitHub URL (e.g., "https://github.com/chernandezba/zesarux.git")
+
+GitBuilder will:
+  - Detect the build system automatically
+  - Store the repository in the database
+  - Optionally clone and build immediately
+
+EDIT A REPOSITORY (Option 2)
+----------------------------
+Modify repository details including:
+  - Repository name
+  - GitHub URL
+  - Build type override
+  - Build file path
+
+REMOVE A REPOSITORY (Option 3)
+------------------------------
+Delete a repository from the database.
+Note: This does not delete the cloned source code from disk.
+Use the file browser or terminal to remove source files if needed.
+
+SEARCH REPOSITORIES (Option 4)
+------------------------------
+Find repositories by name or URL.
+Useful when you have many repositories in your database.
+
+================================================================================
+[3] BUILD OPERATIONS
+================================================================================
+
+DOWNLOAD AND BUILD (Option 5)
+-----------------------------
+Clone a repository (if not already cloned) and build it.
+
+The build process:
+  1. Clone or update the repository
+  2. Check for gitbuildfile (prompts to use if found)
+  3. Check and install dependencies
+  4. Detect build system (CMake, Autotools, Make, etc.)
+  5. Execute the build with parallel jobs
+  6. Find and register the built binary
+  7. Optionally create a desktop launcher
+
+BUILD QUEUE (Option 6)
+----------------------
+Queue multiple repositories for sequential building.
+
+Features:
+  - Add repositories to queue with priority levels
+  - Process queue automatically
+  - View queue status
+  - Remove items from queue
+
+BUILD PROFILES (Option 7)
+-------------------------
+Save and reuse build configurations across repositories.
+
+Profile settings include:
+  - Configure flags
+  - Make flags
+  - CMake flags
+  - Strip debug symbols option
+  - Use RAM disk option
+
+BUILD HISTORY (Option 8)
+------------------------
+View past builds with:
+  - Timestamps
+  - Build duration
+  - Success/failure status
+  - Build logs
+
+================================================================================
+[4] REPOSITORY DETAILS
+================================================================================
+
+SEE/EDIT BUILD DETAILS (Option 9)
+---------------------------------
+Comprehensive view and edit screen for repository settings.
+
+Available options:
+  1-5   Edit basic info (name, URL, build type, build file, binary path)
+  6-8   Edit build flags (configure, make, cmake)
+  9     Manage dependencies
+  10    Edit repository notes
+  11    View build log
+  12    Clean build directory
+  13    Create desktop launcher
+  14    Delete desktop launcher
+  15    Backup binary
+  16    Toggle debug stripping
+  17    Toggle RAM disk usage
+
+Hotkeys in this screen:
+  - H: Show help
+  - L: Launch this repository's binary
+  - Esc: Return to main menu
+
+LAUNCH A BINARY (Option 10)
+---------------------------
+Run a built binary from a repository.
+
+Launch modes:
+  - Quiet: Run in background (no terminal output)
+  - Verbose: Run in foreground (shows output)
+
+If no binary is registered, you can browse for one.
+
+DEPENDENCIES (Option 11)
+------------------------
+Manage software dependencies required to build repositories.
+
+Features:
+  - View dependencies for a repository
+  - Add new dependencies
+  - Remove dependencies
+  - Check if dependencies are installed
+  - Install missing dependencies (requires sudo)
+
+REPOSITORY NOTES (Option 12)
+----------------------------
+Add notes to repositories for future reference.
+
+Notes are displayed after successful builds and can contain:
+  - Build instructions
+  - Configuration tips
+  - Known issues
+  - Links to documentation
+
+================================================================================
+[5] IMPORT/EXPORT (GITBUILDFILE)
+================================================================================
+
+SAVE GITBUILDFILE (Option 13)
+-----------------------------
+Export a repository's build configuration to a gitbuildfile.
+
+The gitbuildfile is saved to:
+  - The repository's root directory
+  - A backup copy in the gitbuildfiles/ directory
+
+SAVE ALL GITBUILDFILES (Option 14)
+----------------------------------
+Export gitbuildfiles for all repositories at once.
+Files are saved to the gitbuildfiles/ directory.
+
+IMPORT GITBUILDFILE (Option 15)
+-------------------------------
+Import a build configuration from a gitbuildfile.
+
+Use this to:
+  - Share build configurations between machines
+  - Restore configurations after reinstalling
+  - Import configurations from other users
+
+GITBUILDFILE FORMAT
+-------------------
+The gitbuildfile contains:
+
+  REPO_NAME="example-repo"
+  REPO_URL="https://github.com/user/example-repo.git"
+  BUILD_METHOD="cmake"
+  DEPENDENCIES="libsdl2-dev libssl-dev"
+  BUILD_FILE="src/CMakeLists.txt"
+  CONFIGURE_FLAGS="--enable-feature"
+  MAKE_FLAGS="-j4"
+  CMAKE_FLAGS="-DCMAKE_BUILD_TYPE=Release"
+  BINARY_PATH="~/.local/share/gitbuilder/src/repo/build/bin/app"
+  LAUNCHER_ICON="~/.local/share/gitbuilder/src/repo/icon.png"
+  LAUNCHER_CATEGORY="Development"
+  NOTES="Build notes here"
+
+All fields are optional. Use ~/ for home directory paths.
+
+Gitbuildfile names can be given a suffix to speciate them for specific build purposes.
+For example, gitbuildfile.generic, gitbuildfile.ubuntu, gitbuildfile.arch, etc.
+
+================================================================================
+[6] SYSTEM SETTINGS
+================================================================================
+
+REFRESH GIT REPOSITORY INFO (Option 16)
+---------------------------------------
+Update commit dates and status for all repositories.
+Checks GitHub for the latest commit information.
+
+SETTINGS (Option 17)
+--------------------
+Configure GitBuilder preferences:
+
+  1. Theme Selection
+     Choose from: default, ocean, forest, mono
+
+  2. Desktop Notifications
+     Enable/disable build completion notifications
+     (Requires notify-send)
+
+  3. Auto-backup Settings
+     Configure automatic database backups
+
+  4. Backup Database
+     Create a manual backup of the database
+
+  5. Restore Database
+     Restore from a previous backup
+
+  6. Check for Updates
+     Check if a new version of GitBuilder is available
+
+INSTALL GITBUILDER LAUNCHER (Option 18)
+---------------------------------------
+Create a desktop launcher for GitBuilder itself.
+This option only appears if the launcher doesn't exist.
+
+The launcher will appear in your application menu under "Development".
+
+================================================================================
+[7] FILE BROWSER
+================================================================================
+
+The interactive file browser is used for selecting:
+  - Binary files
+  - Icon files
+  - Build files
+  - Directories
+
+Navigation:
+  - Numbers: Select items or navigate to directories
+  - 0: Go to parent directory
+  - Esc or q: Cancel and return
+
+Display:
+  - Current directory path shown at top
+  - Directories listed first with [DIR] prefix
+  - Files listed with appropriate labels
+  - Executable files marked for binary selection
+
+================================================================================
+[8] BUILD SYSTEM SUPPORT
+================================================================================
+
+GitBuilder automatically detects and supports these build systems:
+
+CMake:
+  - Detects CMakeLists.txt
+  - Creates build directory
+  - Runs cmake and make
+
+Autotools:
+  - Detects configure, configure.ac, autogen.sh
+  - Runs autogen.sh if needed
+  - Runs configure and make
+
+Make:
+  - Detects Makefile
+  - Runs make directly
+
+Meson:
+  - Detects meson.build
+  - Creates build directory
+  - Runs meson setup and ninja
+
+Gradle:
+  - Detects build.gradle
+  - Runs ./gradlew or gradle
+
+Maven:
+  - Detects pom.xml
+  - Runs mvn package
+
+Cargo (Rust):
+  - Detects Cargo.toml
+  - Runs cargo build --release
+
+Go:
+  - Detects go.mod
+  - Runs go build
+
+Node.js:
+  - Detects package.json
+  - Runs npm install and npm run build
+
+Custom:
+  - Use gitbuildfile for custom build commands
+
+================================================================================
+[9] BUILD OPTIMIZATION
+================================================================================
+
+PARALLEL BUILDS
+---------------
+GitBuilder automatically detects CPU cores and uses parallel compilation:
+  - Make: -j<cores>
+  - Ninja: -j<cores>
+  - Gradle: --parallel --max-workers=<cores>
+  - Maven: -T <cores>
+
+Override with: GITBUILDER_JOBS=N gitbuilder
+
+CCACHE INTEGRATION
+------------------
+If ccache is installed, GitBuilder uses it automatically for faster rebuilds.
+Install ccache: sudo apt install ccache
+
+RAM DISK SUPPORT
+----------------
+For faster builds on large projects, enable RAM disk:
+  - Minimum 2GB free RAM required
+  - Source copied to RAM disk before building
+  - Results copied back after build
+  - Automatically unmounted on completion
+
+Enable per-repository in build details (option 17).
+
+DEBUG SYMBOL STRIPPING
+----------------------
+Enable to create smaller, faster binaries:
+  - Sets CFLAGS="-O2 -DNDEBUG"
+  - Uses CMAKE_BUILD_TYPE=Release
+  - Uses --buildtype=release for Meson
+
+Enable per-repository in build details (option 16).
+
+================================================================================
+[10] DESKTOP LAUNCHERS
+================================================================================
+
+Create .desktop files for built applications.
+
+Creating a Launcher:
+  1. Build the repository
+  2. Register the binary
+  3. Select "Create desktop launcher" from build details
+  4. Choose launcher name
+  5. Select category (Development, Game, Graphics, etc.)
+  6. Select icon (browse or use system icon)
+
+Launcher Location:
+  ~/.local/share/applications/
+
+The launcher will appear in your application menu after creation.
+You may need to log out and back in for it to appear.
+
+Managing Launchers:
+  - Create: Build details option 13
+  - Delete: Build details option 14
+
+================================================================================
+[11] DATA STORAGE & BACKUP
+================================================================================
+
+DATA LOCATIONS
+--------------
+GitBuilder stores data in ~/.local/share/gitbuilder/:
+
+  repos.db        Main SQLite database
+  config          User preferences (theme, notifications)
+  src/            Cloned repository source code
+  backups/        Database backups
+  history/        Build history records
+  profiles/       Saved build profiles
+  binary_backups/ Backed up binaries
+
+Script-relative directories:
+  gitbuildfiles/  Saved gitbuildfile configurations
+  plugins/        Custom plugins (future use)
+
+BACKUP & RESTORE
+----------------
+Backup your database regularly:
+  - Settings menu > Backup Database
+  - Command line: gitbuilder --backup ~/backup.sql
+
+Restore from backup:
+  - Settings menu > Restore Database
+  - Command line: gitbuilder --restore ~/backup.sql
+
+Auto-backup:
+  - Enabled by default for destructive operations
+  - Keeps recent backups automatically
+
+================================================================================
+[12] TROUBLESHOOTING
+================================================================================
+
+BUILD FAILURES
+--------------
+1. Check the build log (build details option 11)
+2. Verify dependencies are installed (option 9)
+3. Try cleaning the build directory (option 12)
+4. Check for gitbuildfile with custom settings
+
+MISSING BINARY
+--------------
+1. Use the file browser to locate the binary
+2. Check the build log for the output location
+3. Some projects install to different locations
+
+DEPENDENCY ISSUES
+-----------------
+1. Use the dependencies menu to add required packages
+2. Run dependency check before building
+3. Some packages may have different names on different distros
+
+DATABASE ISSUES
+---------------
+1. Restore from a backup
+2. Check file permissions on ~/.local/share/gitbuilder/
+3. Ensure SQLite3 is installed
+
+LAUNCHER NOT APPEARING
+----------------------
+1. Log out and back in
+2. Check ~/.local/share/applications/ for the .desktop file
+3. Verify the file has execute permission
+
+HOTKEYS NOT WORKING
+-------------------
+1. Ensure you're at a menu prompt
+2. Try pressing the key without other input
+3. Some terminals may intercept certain keys
+
+================================================================================
+                              END OF HELP FILE
+================================================================================
+For more information, visit: https://github.com/vr51/GitBuilder
+================================================================================
