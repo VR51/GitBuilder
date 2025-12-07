@@ -3,9 +3,9 @@
 # GitBuilder - GitHub repository management and build automation tool
 # Author: Cascade
 # Prompt Engineer: VR51
-# Version: 2.0.0
+# Version: 2.0.1
 # Created: 2025-04-11
-# Updated: 2025-12-05
+# Updated: 2025-12-07
 # License: GNU General Public License v3.0
 # Donate: https://paypal.me/vr51/
 #
@@ -34,7 +34,16 @@ VERSION="2.0.0"
 GITHUB_REPO="https://github.com/vr51/GitBuilder"
 
 show_help() {
-    cat << EOF
+    # Read help from HELP file if it exists, otherwise show basic help
+    local help_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/HELP"
+    if [ -f "$help_file" ]; then
+        # Show the quick reference section (up to the detailed sections)
+        sed -n '1,/^=.*HELP SECTIONS INDEX/p' "$help_file" | head -n -1
+        echo ""
+        echo "For detailed help, run: gitbuilder (then press H)"
+        echo "Or view the full HELP file: less $help_file"
+    else
+        cat << EOF
 GitBuilder v${VERSION} - GitHub repository management and build automation tool
 
 Usage: $(basename "$0") [OPTIONS]
@@ -61,6 +70,7 @@ Environment Variables:
 
 For more information, see: $GITHUB_REPO
 EOF
+    fi
 }
 
 show_version() {
@@ -121,6 +131,7 @@ RAMDISK_ACTIVE=false
 # Gitbuildfiles directory (relative to script location)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GITBUILDFILES_DIR="$SCRIPT_DIR/gitbuildfiles"
+HELP_FILE="$SCRIPT_DIR/HELP"
 
 # Additional directories
 BUILD_HISTORY_DIR="$DB_DIR/history"
@@ -133,6 +144,10 @@ PLUGINS_DIR="$SCRIPT_DIR/plugins"
 BINARY_BACKUP_LIMIT=3  # Maximum backups per repository
 CONFIG_FILE="$DB_DIR/config"
 BACKUP_DIR="$DB_DIR/backups"
+
+# GitBuilder's own desktop launcher
+GITBUILDER_DESKTOP_FILE="$DESKTOP_LAUNCHERS_DIR/gitbuilder.desktop"
+GITBUILDER_LAUNCHER_EXISTS=false
 
 # Ensure directories exist
 mkdir -p "$DB_DIR" "$SRC_DIR" "$GITBUILDFILES_DIR" "$BUILD_HISTORY_DIR" "$BUILD_PROFILES_DIR" "$BINARY_BACKUPS_DIR" "$PLUGINS_DIR" "$BACKUP_DIR"
@@ -230,7 +245,7 @@ load_config() {
 
 # Save configuration
 save_config() {
-    cat > "$CONFIG_FILE" << EOF
+    cat >| "$CONFIG_FILE" << EOF
 # GitBuilder Configuration File
 # Generated: $(date -Iseconds)
 
@@ -2876,13 +2891,14 @@ show_build_details() {
         # Get user choice with hotkey support (H for help, L for launch)
         echo
         local esc_status=0
-        read_with_esc "Select option (1-21): " choice "HL" || esc_status=$?
+        read_with_esc "Select option (1-21): " choice "HLG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc - return to main menu
             72) show_help_page; continue ;;  # H - Help
             76) launch_binary "$repo_id"; continue ;;  # L - Quick launch this repo's binary
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         # Handle menu options
@@ -3310,6 +3326,13 @@ save_gitbuildfile() {
     local notes
     notes=$(sqlite3 "$DB_FILE" "SELECT notes FROM repository_notes WHERE repo_id = $repo_id;" || echo "")
     
+    # Get desktop launcher settings
+    local launcher_info
+    launcher_info=$(sqlite3 "$DB_FILE" "SELECT icon_path, menu_category FROM desktop_launchers WHERE repo_id = $repo_id;" || echo "")
+    local launcher_icon launcher_category
+    launcher_icon=$(echo "$launcher_info" | cut -d'|' -f1)
+    launcher_category=$(echo "$launcher_info" | cut -d'|' -f2)
+    
     echo -e "\n${BLUE}Saving gitbuildfile for $name${NC}"
     
     # Check if repository exists locally
@@ -3333,6 +3356,7 @@ save_gitbuildfile() {
     # Replace home directory path with ~ for portability
     build_file_path="${build_file_path/#$HOME/\~}"
     binary_path="${binary_path/#$HOME/\~}"
+    launcher_icon="${launcher_icon/#$HOME/\~}"
     
     # Create gitbuildfile content
     local gitbuildfile_content="# GitBuilder build configuration file
@@ -3362,6 +3386,10 @@ CMAKE_FLAGS=\"$cmake_flags\"
 
 # Path to the compiled binary (relative to repo root or absolute)
 BINARY_PATH=\"$binary_path\"
+
+# Desktop launcher settings
+LAUNCHER_ICON=\"$launcher_icon\"
+LAUNCHER_CATEGORY=\"$launcher_category\"
 
 # Repository notes (displayed after build)
 NOTES=\"$notes\"
@@ -3404,6 +3432,133 @@ NOTES=\"$notes\"
         error "Failed to save gitbuildfile"
         return 1
     fi
+}
+
+# Save gitbuildfiles for all repositories
+save_all_gitbuildfiles() {
+    echo -e "\n${BLUE}Save gitbuildfiles for all repositories${NC}"
+    echo "============================================"
+    
+    # Get all repository IDs and names
+    local repos
+    repos=$(sqlite3 "$DB_FILE" "SELECT id, name FROM repositories WHERE deleted = 0 ORDER BY name;")
+    
+    if [ -z "$repos" ]; then
+        echo -e "${YELLOW}No repositories found${NC}"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    local count=0
+    local total=0
+    local failed=0
+    
+    # Count total repos
+    total=$(echo "$repos" | wc -l)
+    
+    echo -e "Found ${GREEN}$total${NC} repositories"
+    echo ""
+    read -rp "Save gitbuildfiles for all repositories? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        read -rp "Press Enter to continue..."
+        return 0
+    fi
+    
+    echo ""
+    
+    while IFS='|' read -r repo_id repo_name; do
+        echo -e "${CYAN}Processing: $repo_name${NC}"
+        
+        # Get repository info
+        local repo_info
+        repo_info=$(sqlite3 "$DB_FILE" "SELECT name, url, build_type, build_file_path, binary_path FROM repositories WHERE id = $repo_id;")
+        
+        local name url build_type build_file_path binary_path
+        name=$(echo "$repo_info" | cut -d'|' -f1)
+        url=$(echo "$repo_info" | cut -d'|' -f2)
+        build_type=$(echo "$repo_info" | cut -d'|' -f3)
+        build_file_path=$(echo "$repo_info" | cut -d'|' -f4)
+        binary_path=$(echo "$repo_info" | cut -d'|' -f5)
+        
+        # Get build configuration
+        local build_config
+        build_config=$(get_build_config "$repo_id")
+        local configure_flags make_flags cmake_flags dependencies
+        configure_flags=$(echo "$build_config" | cut -d'|' -f1)
+        make_flags=$(echo "$build_config" | cut -d'|' -f2)
+        cmake_flags=$(echo "$build_config" | cut -d'|' -f3)
+        dependencies=$(echo "$build_config" | cut -d'|' -f4)
+        
+        # Get notes
+        local notes
+        notes=$(sqlite3 "$DB_FILE" "SELECT notes FROM repository_notes WHERE repo_id = $repo_id;" || echo "")
+        
+        # Get desktop launcher settings
+        local launcher_info
+        launcher_info=$(sqlite3 "$DB_FILE" "SELECT icon_path, menu_category FROM desktop_launchers WHERE repo_id = $repo_id;" || echo "")
+        local launcher_icon launcher_category
+        launcher_icon=$(echo "$launcher_info" | cut -d'|' -f1)
+        launcher_category=$(echo "$launcher_info" | cut -d'|' -f2)
+        
+        # Replace home directory path with ~ for portability
+        build_file_path="${build_file_path/#$HOME/\~}"
+        binary_path="${binary_path/#$HOME/\~}"
+        launcher_icon="${launcher_icon/#$HOME/\~}"
+        
+        # Create gitbuildfile content
+        local gitbuildfile_content="# GitBuilder build configuration file
+# Generated automatically by GitBuilder
+
+# Repository information
+REPO_NAME=\"$name\"
+REPO_URL=\"$url\"
+
+# Build method (cmake, autotools, make, etc.)
+BUILD_METHOD=\"$build_type\"
+
+# Space-separated list of dependencies
+DEPENDENCIES=\"$dependencies\"
+
+# Path to the build file (relative to repo root or absolute)
+BUILD_FILE=\"$build_file_path\"
+
+# Configure flags for autotools/cmake
+CONFIGURE_FLAGS=\"$configure_flags\"
+
+# Make flags
+MAKE_FLAGS=\"$make_flags\"
+
+# CMake flags
+CMAKE_FLAGS=\"$cmake_flags\"
+
+# Path to the compiled binary (relative to repo root or absolute)
+BINARY_PATH=\"$binary_path\"
+
+# Desktop launcher settings
+LAUNCHER_ICON=\"$launcher_icon\"
+LAUNCHER_CATEGORY=\"$launcher_category\"
+
+# Repository notes (displayed after build)
+NOTES=\"$notes\"
+"
+        
+        # Save to gitbuildfiles directory only (don't require local repo)
+        local gitbuildfiles_copy="$GITBUILDFILES_DIR/gitbuildfile-$name"
+        
+        if echo "$gitbuildfile_content" >| "$gitbuildfiles_copy" 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} Saved to $gitbuildfiles_copy"
+            ((count++))
+        else
+            echo -e "  ${RED}✗${NC} Failed to save"
+            ((failed++))
+        fi
+    done <<< "$repos"
+    
+    echo ""
+    echo "============================================"
+    echo -e "${GREEN}Saved: $count${NC} | ${RED}Failed: $failed${NC} | Total: $total"
+    read -rp "Press Enter to continue..."
 }
 
 # Import gitbuildfile from gitbuildfiles directory
@@ -3592,17 +3747,18 @@ repository_notes_menu() {
         
         echo ""
         local esc_status=0
-        read_with_esc "Select option: " choice "H" || esc_status=$?
+        read_with_esc "Select option: " choice "HG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc - return to main menu
             72) show_help_page; continue ;;  # H - Help
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         # Handle menu options
         case $choice in
-            1)
+            1) 
                 read_repository_notes
                 ;;
             2)
@@ -3745,35 +3901,46 @@ main_menu() {
     while true; do
         show_standard_layout "Main Menu"
         echo -e "${CYAN}Repository Management${NC}"
+        echo -e "${GRAY}Help: G + 2${NC}"
         echo "1) Add a repository"
         echo "2) Edit a repository"
         echo "3) Remove a repository"
         echo "4) Search existing repositories"
         echo ""
         echo -e "${CYAN}Build Operations${NC}"
+        echo -e "${GRAY}Help: G + 3${NC}"
         echo "5) Download and build an existing repository"
         echo "6) Build queue"
         echo "7) Build profiles"
         echo "8) Build history"
         echo ""
         echo -e "${CYAN}Repository Details${NC}"
+        echo -e "${GRAY}Help: G + 4${NC}"
         echo "9) See/edit build details"
         echo "10) Launch a binary"
         echo "11) Dependencies"
         echo "12) Repository notes"
         echo ""
         echo -e "${CYAN}Import/Export${NC}"
+        echo -e "${GRAY}Help: G + 5${NC}"
         echo "13) Save gitbuildfile"
-        echo "14) Import gitbuildfile"
+        echo "14) Save all gitbuildfiles"
+        echo "15) Import gitbuildfile"
         echo ""
         echo -e "${CYAN}System${NC}"
-        echo "15) Refresh Git repository information"
-        echo "16) Settings"
+        echo -e "${GRAY}Help: G + 6${NC}"
+        echo "16) Refresh Git repository information"
+        echo "17) Settings"
+        if [ "$GITBUILDER_LAUNCHER_EXISTS" = false ]; then
+            echo "18) Install GitBuilder desktop launcher"
+        else
+            echo "18) Remove GitBuilder desktop launcher"
+        fi
         
         # Read input with hotkey support
         echo ""
         local esc_status=0
-        read_with_esc "Select option: " choice "HL" || esc_status=$?
+        read_with_esc "Select option: " choice "HLG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
@@ -3787,6 +3954,10 @@ main_menu() {
                 ;;
             76) # L - Quick Launch
                 quick_launch
+                continue
+                ;;
+            71) # G - Goto help section
+                goto_help_section
                 continue
                 ;;
         esac
@@ -3837,9 +4008,17 @@ main_menu() {
                 read -rp "Enter repository ID to save gitbuildfile: " id
                 save_gitbuildfile "$id" || continue
                 ;;
-            14) import_gitbuildfile || continue ;;
-            15) update_all_repos || continue ;;
-            16) settings_menu ;;
+            14) save_all_gitbuildfiles || continue ;;
+            15) import_gitbuildfile || continue ;;
+            16) update_all_repos || continue ;;
+            17) settings_menu ;;
+            18) 
+                if [ "$GITBUILDER_LAUNCHER_EXISTS" = false ]; then
+                    install_gitbuilder_launcher
+                else
+                    remove_gitbuilder_launcher
+                fi
+                ;;
             *) 
                 echo -e "${RED}Invalid option${NC}"
                 sleep 1
@@ -3860,13 +4039,13 @@ show_repository_table() {
 }
 
 # Read input with immediate Esc key detection and hotkey support
-# Returns: 0 = normal input, 27 = Esc, 72 = H (help), 76 = L (launch)
+# Returns: 0 = normal input, 27 = Esc, 72 = H (help), 76 = L (launch), 71 = G (goto help)
 # Usage: read_with_esc "prompt" variable [hotkeys]
-#   hotkeys: string of enabled hotkeys, e.g., "HL" for Help and Launch
+#   hotkeys: string of enabled hotkeys, e.g., "HLG" for Help, Launch, and Goto
 read_with_esc() {
 	local prompt="$1"
 	local _out_var="${2:-}"
-	local hotkeys="${3:-HL}"  # Default: H and L enabled
+	local hotkeys="${3:-HLG}"  # Default: H, L, and G enabled
 	local input=""
 	local char
 	
@@ -3891,6 +4070,11 @@ read_with_esc() {
 			if [[ "$hotkeys" == *"L"* ]] && [[ "$char" == "L" || "$char" == "l" ]]; then
 				echo ""
 				return 76  # Return code for Launch
+			fi
+			# G for Goto help section
+			if [[ "$hotkeys" == *"G"* ]] && [[ "$char" == "G" || "$char" == "g" ]]; then
+				echo ""
+				return 71  # Return code for Goto
 			fi
 		fi
 		
@@ -3928,7 +4112,7 @@ read_with_esc() {
 # Display common key shortcuts
 show_common_keys() {
     echo ""
-    echo -e "${GRAY}Esc = Back/Exit | H = Help | L = Quick Launch${NC}"
+    echo -e "${GRAY}Esc = Back/Exit | H = Help | G = Goto Help # | L = Quick Launch${NC}"
 }
 
 # Quick launch - prompt user to select and launch a binary
@@ -4000,56 +4184,105 @@ quick_launch() {
     fi
 }
 
-# Show help page
+# Show help page (reads from HELP file)
 show_help_page() {
     clear
+    if [ -f "$HELP_FILE" ]; then
+        # Use less for scrollable help, or cat if less unavailable
+        if command -v less &>/dev/null; then
+            less -R "$HELP_FILE"
+        else
+            cat "$HELP_FILE"
+            echo ""
+            echo -e "${GRAY}Press any key to return...${NC}"
+            read -r -n 1
+        fi
+    else
+        # Fallback if HELP file doesn't exist
+        echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}║${NC}              ${CYAN}GitBuilder v${VERSION} - Help${NC}                        ${YELLOW}║${NC}"
+        echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${RED}HELP file not found at: $HELP_FILE${NC}"
+        echo ""
+        echo -e "${BLUE}Keyboard Shortcuts${NC}"
+        echo "  Esc     - Return to previous screen / Exit from main menu"
+        echo "  H       - Show this help page (from any menu)"
+        echo "  L       - Quick launch a binary (main menu & build details)"
+        echo "  G       - Go to specific help section"
+        echo "  0-9     - Select menu options"
+        echo ""
+        echo -e "${CYAN}GitHub: $GITHUB_REPO${NC}"
+        echo ""
+        echo -e "${GRAY}Press any key to return...${NC}"
+        read -r -n 1
+    fi
+}
+
+# Show specific help section by number
+show_help_section() {
+    local section_num="$1"
+    
+    if [ ! -f "$HELP_FILE" ]; then
+        echo -e "${RED}HELP file not found${NC}"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    # Extract the section content between [N] markers
+    # Find the line with [N] UPPERCASE TITLE (section header), skip the === line, print until next section
+    local section_content
+    section_content=$(awk -v num="$section_num" '
+        BEGIN { found=0 }
+        $0 ~ "^\\[" num "\\] [A-Z]" { found=1; print; next }
+        found && /^=+$/ && !started { started=1; next }
+        found && started && /^\[[0-9]+\] [A-Z]/ { exit }
+        found && started { print }
+    ' "$HELP_FILE")
+    
+    if [ -z "$section_content" ]; then
+        echo -e "${RED}Help section [$section_num] not found${NC}"
+        echo "Available sections: 1-12"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    clear
     echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${YELLOW}║${NC}              ${CYAN}GitBuilder v${VERSION} - Help${NC}                        ${YELLOW}║${NC}"
+    echo -e "${YELLOW}║${NC}              ${CYAN}GitBuilder Help - Section [$section_num]${NC}                  ${YELLOW}║${NC}"
     echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "${BLUE}Keyboard Shortcuts${NC}"
-    echo "  Esc     - Return to previous screen / Exit from main menu"
-    echo "  H       - Show this help page (from any menu)"
-    echo "  L       - Quick launch a binary (main menu & build details)"
-    echo "  0-9     - Select menu options"
-    echo ""
-    echo -e "${BLUE}Main Menu Categories${NC}"
-    echo "  1-4     Repository Management (add, edit, remove, search)"
-    echo "  5-8     Build Operations (build, queue, profiles, history)"
-    echo "  9-12    Repository Details (details, launch, deps, notes)"
-    echo "  13-14   Import/Export (gitbuildfile save/import)"
-    echo "  15-16   System (refresh repos, settings)"
-    echo ""
-    echo -e "${BLUE}Build System Support${NC}"
-    echo "  - CMake, Autotools (configure), Make, Meson, Ninja"
-    echo "  - Gradle, Maven, Cargo (Rust), Go, npm/yarn"
-    echo "  - Custom gitbuildfile configurations"
-    echo ""
-    echo -e "${BLUE}Build Optimization${NC}"
-    echo "  - Parallel builds (auto-detected CPU cores)"
-    echo "  - ccache integration for faster rebuilds"
-    echo "  - RAM disk support for large projects"
-    echo "  - Debug symbol stripping for smaller binaries"
-    echo ""
-    echo -e "${BLUE}Data Storage${NC}"
-    echo "  Database:  ~/.local/share/gitbuilder/repos.db"
-    echo "  Config:    ~/.local/share/gitbuilder/config"
-    echo "  Sources:   ~/.local/share/gitbuilder/src/"
-    echo "  Backups:   ~/.local/share/gitbuilder/backups/"
-    echo ""
-    echo -e "${BLUE}Command Line Options${NC}"
-    echo "  -h, --help          Show help message"
-    echo "  -v, --version       Show version"
-    echo "  -l, --list          List all repositories"
-    echo "  -b, --build ID      Build specific repository"
-    echo "  --backup FILE       Backup database"
-    echo "  --restore FILE      Restore database"
-    echo "  --check-update      Check for updates"
-    echo ""
-    echo -e "${CYAN}GitHub: $GITHUB_REPO${NC}"
+    echo "$section_content"
     echo ""
     echo -e "${GRAY}Press any key to return...${NC}"
     read -r -n 1
+}
+
+# Prompt for help section number and display it
+goto_help_section() {
+    echo ""
+    echo -e "${CYAN}Help Sections:${NC}"
+    echo "  [1]  Main Menu Overview"
+    echo "  [2]  Repository Management"
+    echo "  [3]  Build Operations"
+    echo "  [4]  Repository Details"
+    echo "  [5]  Import/Export (gitbuildfile)"
+    echo "  [6]  System Settings"
+    echo "  [7]  File Browser"
+    echo "  [8]  Build System Support"
+    echo "  [9]  Build Optimization"
+    echo "  [10] Desktop Launchers"
+    echo "  [11] Data Storage & Backup"
+    echo "  [12] Troubleshooting"
+    echo ""
+    read -rp "Enter section number (1-12): " section_num
+    
+    if [[ "$section_num" =~ ^[0-9]+$ ]] && [ "$section_num" -ge 1 ] && [ "$section_num" -le 12 ]; then
+        show_help_section "$section_num"
+    else
+        echo -e "${RED}Invalid section number${NC}"
+        sleep 1
+    fi
 }
 
 # Standard layout for all screens
@@ -4549,12 +4782,13 @@ binary_backups_menu() {
         
         echo ""
         local esc_status=0
-        read_with_esc "Select option: " choice "H" || esc_status=$?
+        read_with_esc "Select option: " choice "HG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc
             72) show_help_page; continue ;;  # H - Help
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         case $choice in
@@ -4578,6 +4812,136 @@ binary_backups_menu() {
 
 # Available menu categories for .desktop files
 DESKTOP_CATEGORIES=("Development" "Game" "Graphics" "Network" "Office" "Science" "System" "Utility" "AudioVideo" "Education")
+
+# Check and update GitBuilder's own desktop launcher
+check_gitbuilder_launcher() {
+    local script_path
+    script_path=$(realpath "${BASH_SOURCE[0]}")
+    
+    # Expected launcher content
+    local expected_name="GitBuilder"
+    local expected_comment="GitHub Repository Manager and Build Automation Tool"
+    local expected_exec="$script_path"
+    local expected_icon="utilities-terminal"
+    local expected_category="Development"
+    
+    if [ -f "$GITBUILDER_DESKTOP_FILE" ]; then
+        GITBUILDER_LAUNCHER_EXISTS=true
+        
+        # Read current values from the desktop file
+        local current_name current_comment current_exec current_icon
+        current_name=$(grep "^Name=" "$GITBUILDER_DESKTOP_FILE" 2>/dev/null | cut -d'=' -f2-)
+        current_comment=$(grep "^Comment=" "$GITBUILDER_DESKTOP_FILE" 2>/dev/null | cut -d'=' -f2-)
+        current_exec=$(grep "^Exec=" "$GITBUILDER_DESKTOP_FILE" 2>/dev/null | cut -d'=' -f2-)
+        current_icon=$(grep "^Icon=" "$GITBUILDER_DESKTOP_FILE" 2>/dev/null | cut -d'=' -f2-)
+        
+        # Check if any values need updating
+        local needs_update=false
+        if [ "$current_name" != "$expected_name" ] || \
+           [ "$current_comment" != "$expected_comment" ] || \
+           [ "$current_exec" != "$expected_exec" ] || \
+           [ "$current_icon" != "$expected_icon" ]; then
+            needs_update=true
+        fi
+        
+        # Update if necessary (silently)
+        if [ "$needs_update" = true ]; then
+            create_gitbuilder_launcher_file "$script_path" "$expected_name" "$expected_comment" "$expected_icon" "$expected_category"
+        fi
+    else
+        GITBUILDER_LAUNCHER_EXISTS=false
+    fi
+}
+
+# Create GitBuilder's desktop launcher file
+create_gitbuilder_launcher_file() {
+    local exec_path="$1"
+    local name="$2"
+    local comment="$3"
+    local icon="$4"
+    local category="$5"
+    
+    # Ensure applications directory exists
+    mkdir -p "$DESKTOP_LAUNCHERS_DIR"
+    
+    cat > "$GITBUILDER_DESKTOP_FILE" << EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=$name
+Comment=$comment
+Exec=$exec_path
+Icon=$icon
+Terminal=true
+Categories=$category;
+StartupNotify=false
+EOF
+    
+    chmod +x "$GITBUILDER_DESKTOP_FILE"
+}
+
+# Install GitBuilder's desktop launcher (interactive)
+install_gitbuilder_launcher() {
+    local script_path
+    script_path=$(realpath "${BASH_SOURCE[0]}")
+    
+    echo -e "\n${BLUE}Install GitBuilder Desktop Launcher${NC}"
+    echo "============================================"
+    echo ""
+    echo "This will create a desktop launcher for GitBuilder"
+    echo "so you can launch it from your application menu."
+    echo ""
+    echo -e "Location: ${CYAN}$GITBUILDER_DESKTOP_FILE${NC}"
+    echo -e "Binary:   ${CYAN}$script_path${NC}"
+    echo ""
+    
+    read -rp "Install desktop launcher? (Y/n): " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        echo -e "${YELLOW}Installation cancelled${NC}"
+        read -rp "Press Enter to continue..."
+        return 0
+    fi
+    
+    create_gitbuilder_launcher_file "$script_path" "GitBuilder" "GitHub Repository Manager and Build Automation Tool" "utilities-terminal" "Development"
+    
+    if [ -f "$GITBUILDER_DESKTOP_FILE" ]; then
+        GITBUILDER_LAUNCHER_EXISTS=true
+        echo -e "\n${GREEN}Desktop launcher installed successfully!${NC}"
+        echo -e "${CYAN}GitBuilder should now appear in your application menu under 'Development'.${NC}"
+        echo -e "${YELLOW}Note: You may need to log out and back in for it to appear.${NC}"
+    else
+        echo -e "\n${RED}Failed to create desktop launcher${NC}"
+    fi
+    
+    read -rp "Press Enter to continue..."
+}
+
+# Remove GitBuilder's desktop launcher (interactive)
+remove_gitbuilder_launcher() {
+    echo -e "\n${BLUE}Remove GitBuilder Desktop Launcher${NC}"
+    echo "============================================"
+    echo ""
+    echo -e "This will remove the desktop launcher for GitBuilder."
+    echo -e "Location: ${CYAN}$GITBUILDER_DESKTOP_FILE${NC}"
+    echo ""
+    
+    read -rp "Remove desktop launcher? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Removal cancelled${NC}"
+        read -rp "Press Enter to continue..."
+        return 0
+    fi
+    
+    if rm -f "$GITBUILDER_DESKTOP_FILE" 2>/dev/null; then
+        GITBUILDER_LAUNCHER_EXISTS=false
+        echo -e "\n${GREEN}Desktop launcher removed successfully!${NC}"
+        echo -e "${YELLOW}Note: You may need to log out and back in for the change to take effect.${NC}"
+    else
+        echo -e "\n${RED}Failed to remove desktop launcher${NC}"
+    fi
+    
+    read -rp "Press Enter to continue..."
+}
 
 # Create a desktop launcher for a repository binary
 create_desktop_launcher() {
@@ -4859,19 +5223,20 @@ build_profiles_menu() {
         
         echo ""
         local esc_status=0
-        read_with_esc "Select option: " choice "H" || esc_status=$?
+        read_with_esc "Select option: " choice "HG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc
             72) show_help_page; continue ;;  # H - Help
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         case $choice in
-            1) list_build_profiles; read -rp "Press Enter to continue..." ;;
+            1) list_build_profiles || true; read -rp "Press Enter to continue..." ;;
             2) create_build_profile ;;
             3) 
-                list_build_profiles
+                list_build_profiles || true
                 read -rp "Enter profile ID to delete: " pid
                 if is_valid_id "$pid"; then
                     auto_backup "profile_delete"
@@ -5039,12 +5404,13 @@ build_queue_menu() {
         
         echo ""
         local esc_status=0
-        read_with_esc "Select option: " choice "H" || esc_status=$?
+        read_with_esc "Select option: " choice "HG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc
             72) show_help_page; continue ;;  # H - Help
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         case $choice in
@@ -5160,12 +5526,13 @@ build_history_menu() {
         
         echo ""
         local esc_status=0
-        read_with_esc "Select option: " choice "H" || esc_status=$?
+        read_with_esc "Select option: " choice "HG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc
             72) show_help_page; continue ;;  # H - Help
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         case $choice in
@@ -5316,12 +5683,13 @@ dependencies_menu() {
         
         echo ""
         local esc_status=0
-        read_with_esc "Select option: " choice "H" || esc_status=$?
+        read_with_esc "Select option: " choice "HG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc
             72) show_help_page; continue ;;  # H - Help
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         case $choice in
@@ -5479,12 +5847,13 @@ theme_menu() {
         
         echo ""
         local esc_status=0
-        read_with_esc "Select theme: " choice "H" || esc_status=$?
+        read_with_esc "Select theme: " choice "HG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc
             72) show_help_page; continue ;;  # H - Help
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         case $choice in
@@ -5509,6 +5878,7 @@ theme_menu() {
 settings_menu() {
     while true; do
         show_standard_layout "Settings"
+        echo -e "${GRAY}Help: G + 6${NC}"
         echo "1) Theme: $THEME"
         echo "2) Notifications: ${NOTIFICATIONS_ENABLED:-true}"
         echo "3) Auto-update check: every ${AUTO_UPDATE_CHECK_DAYS:-7} days"
@@ -5518,12 +5888,13 @@ settings_menu() {
         
         echo ""
         local esc_status=0
-        read_with_esc "Select option: " choice "H" || esc_status=$?
+        read_with_esc "Select option: " choice "HG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
             27) return 0 ;;  # Esc
             72) show_help_page; continue ;;  # H - Help
+            71) goto_help_section; continue ;;  # G - Goto help section
         esac
         
         case $choice in
@@ -5625,4 +5996,5 @@ parse_args "$@"
 check_requirements
 init_db
 update_repository_info
+check_gitbuilder_launcher
 main_menu
