@@ -3330,6 +3330,10 @@ save_gitbuildfile() {
         fi
     fi
     
+    # Replace home directory path with ~ for portability
+    build_file_path="${build_file_path/#$HOME/\~}"
+    binary_path="${binary_path/#$HOME/\~}"
+    
     # Create gitbuildfile content
     local gitbuildfile_content="# GitBuilder build configuration file
 # Generated automatically by GitBuilder
@@ -3741,20 +3745,20 @@ main_menu() {
     while true; do
         show_standard_layout "Main Menu"
         echo -e "${CYAN}Repository Management${NC}"
-        echo "1) Add repository"
-        echo "2) Edit repository"
-        echo "3) Remove repository"
-        echo "4) Search repositories"
+        echo "1) Add a repository"
+        echo "2) Edit a repository"
+        echo "3) Remove a repository"
+        echo "4) Search existing repositories"
         echo ""
         echo -e "${CYAN}Build Operations${NC}"
-        echo "5) Download and build a repository"
+        echo "5) Download and build an existing repository"
         echo "6) Build queue"
         echo "7) Build profiles"
         echo "8) Build history"
         echo ""
         echo -e "${CYAN}Repository Details${NC}"
         echo "9) See/edit build details"
-        echo "10) Launch binary"
+        echo "10) Launch a binary"
         echo "11) Dependencies"
         echo "12) Repository notes"
         echo ""
