@@ -28,8 +28,11 @@ GitBuilder is a powerful command-line tool for managing GitHub repositories, aut
 - **Theme System**: Choose from multiple color themes (default, ocean, forest, mono)
 - **Search & Filter**: Quickly find repositories by name or URL
 - **Backup & Restore**: Export and import your entire database
-- **Help System**: Type H at any menu prompt to view help
+- **Help System**: Press H at any menu for instant help
 - **Editor Selection**: Choose your preferred text editor for notes
+- **Binary Versioning**: Backup binaries before rebuilds with automatic rotation (limit: 3)
+- **Desktop Launchers**: Create .desktop files with icon browsing and menu category support
+- **Quick Launch**: Press L to quickly launch any registered binary
 
 ### Import/Export
 - [**gitbuildfile Support**](https://github.com/VR51/GitBuilder/blob/main/README.md#gitbuildfile-support): Save and import build configurations
@@ -37,7 +40,14 @@ GitBuilder is a powerful command-line tool for managing GitHub repositories, aut
 
 ### Keyboard Shortcuts
 - **Esc**: Return to previous screen (or exit from main menu)
-- **H**: Show help page (type at any menu prompt)
+- **H**: Show help page (works as hotkey from any menu)
+- **L**: Quick launch a binary (main menu and build details)
+
+### File Browser
+- Interactive file browser for selecting binaries, icons, and build files
+- Shows current directory path prominently
+- Navigate with number keys, go to parent with 0
+- **Esc** or **q** to cancel and return
 
 ### Command Line Interface
 - `-h, --help`: Show help message
@@ -93,20 +103,20 @@ Simply run the script:
 The main menu is organized into categories:
 
 **Repository Management**
-1. **Add repository**: Add a new GitHub repository
-2. **Edit repository**: Modify repository details
-3. **Remove repository**: Delete a repository
-4. **Search repositories**: Find repositories by name or URL
+1. **Add a repository**: Add a new GitHub repository
+2. **Edit a repository**: Modify repository details
+3. **Remove a repository**: Delete a repository
+4. **Search existing repositories**: Find repositories by name or URL
 
 **Build Operations**
-5. **Download and build**: Clone and build a repository
+5. **Download and build an existing repository**: Clone and build a repository
 6. **Build queue**: Manage queued builds with priority
 7. **Build profiles**: Create and manage reusable build configurations
 8. **Build history**: View past builds with timestamps and duration
 
 **Repository Details**
 9. **See/edit build details**: View and edit comprehensive build information
-10. **Launch binary**: Run a built binary
+10. **Launch a binary**: Run a built binary
 11. **Dependencies**: Manage repository dependencies
 12. **Repository notes**: View and edit notes
 
@@ -120,7 +130,7 @@ The main menu is organized into categories:
 
 ## gitbuildfile Support
 
-GitBuilder supports a custom build configuration file called `gitbuildfile`. If this file is found in the root of a repository, it will override the auto-detection process and use the specified build configuration.
+GitBuilder supports a custom build configuration file called `gitbuildfile`. If this file is found in the root of a repository, you will be prompted whether to use the build configuration from the file or skip it and use existing/auto-detected settings.
 
 ### Gitbuildfiles Directory
 
@@ -151,7 +161,7 @@ BUILD_METHOD="cmake"
 # Space-separated list of dependencies
 DEPENDENCIES="libsdl2-dev libssl-dev"
 
-# Path to the build file (relative to repo root or absolute)
+# Path to the build file (use ~/ for home directory)
 BUILD_FILE="src/CMakeLists.txt"
 
 # Build flags
@@ -159,8 +169,8 @@ CONFIGURE_FLAGS="--enable-feature1 --disable-feature2"
 MAKE_FLAGS="-j4"
 CMAKE_FLAGS="-DCMAKE_BUILD_TYPE=Release"
 
-# Path to the compiled binary (relative to repo root or absolute)
-BINARY_PATH="build/bin/example"
+# Path to the compiled binary (use ~/ for home directory)
+BINARY_PATH="~/.local/share/gitbuilder/src/example-repo/build/bin/example"
 
 # Repository notes (displayed after build)
 NOTES="Special build instructions or notes"
@@ -188,6 +198,8 @@ After building a project, GitBuilder can:
 - Register them for easy access using an interactive file browser
 - Browse directories and select executable files with a user-friendly interface
 - Launch binaries in either quiet (background) or verbose (terminal output) mode
+- **Prompt to create a desktop launcher** after successful build and binary registration
+- Backup existing binaries before rebuilding (with automatic rotation, limit: 3)
 
 ## Build Optimization
 
