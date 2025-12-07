@@ -1,8 +1,22 @@
 # GitBuilder - GitHub Repository Manager and Build Automation Tool
 
-**Version 2.0.0**
+**Version 2.0.1**
 
 GitBuilder is a powerful command-line tool for managing GitHub repositories, automating the build process, and launching binaries. It provides a comprehensive solution for developers who frequently work with multiple GitHub projects.
+
+GitBuilder has evolved into a comprehensive tool with:
+
+- **Smart build automation**: Auto-detects CMake, Autotools, Make, Meson, Cargo, Go, npm and more
+- **Full repository management**: Add, edit, search, track dependencies
+- **Build optimization**: Parallel builds, ccache, RAM disk support
+- **Desktop integration**: Create launchers for built apps and GitBuilder itself
+- **Portable configs**: gitbuildfile import/export with ~/ path handling
+- **Intuitive navigation**: Hotkeys (H, L, G, Esc), contextual help hints
+- **Consolidated help system**: 12 detailed sections accessible via G + #
+
+It's a genuinely useful tool for anyone who builds software from GitHub repositories. Enjoy using it! 🚀
+
+**Donate**: https://paypal.me/vr51/
 
 ## Features
 
@@ -40,8 +54,16 @@ GitBuilder is a powerful command-line tool for managing GitHub repositories, aut
 
 ### Keyboard Shortcuts
 - **Esc**: Return to previous screen (or exit from main menu)
-- **H**: Show help page (works as hotkey from any menu)
+- **H**: Show full help documentation (works as hotkey from any menu)
 - **L**: Quick launch a binary (main menu and build details)
+- **G**: Go to specific help section (enter section number 1-12)
+
+### Help System
+- Consolidated help documentation in the `HELP` file
+- Press **H** from any menu to view full help with `less`
+- Press **G** to jump to a specific help section by number
+- Menu headings show help key hints (e.g., "Help: G + 2")
+- 12 detailed help sections covering all features
 
 ### File Browser
 - Interactive file browser for selecting binaries, icons, and build files
@@ -122,11 +144,13 @@ The main menu is organized into categories:
 
 **Import/Export**
 13. **Save gitbuildfile**: Export repository settings
-14. **Import gitbuildfile**: Import build configuration
+14. **Save all gitbuildfiles**: Export all repository settings at once
+15. **Import gitbuildfile**: Import build configuration
 
 **System**
-15. **Update all repositories**: Update all repositories
-16. **Settings**: Configure themes, notifications, backups, and more
+16. **Refresh Git repository information**: Update all repositories
+17. **Settings**: Configure themes, notifications, backups, and more
+18. **Install GitBuilder desktop launcher**: Create a launcher for GitBuilder (only shown if not installed)
 
 ## gitbuildfile Support
 
@@ -171,6 +195,10 @@ CMAKE_FLAGS="-DCMAKE_BUILD_TYPE=Release"
 
 # Path to the compiled binary (use ~/ for home directory)
 BINARY_PATH="~/.local/share/gitbuilder/src/example-repo/build/bin/example"
+
+# Desktop launcher settings
+LAUNCHER_ICON="~/.local/share/gitbuilder/src/example-repo/icon.png"
+LAUNCHER_CATEGORY="Development"
 
 # Repository notes (displayed after build)
 NOTES="Special build instructions or notes"
@@ -308,7 +336,7 @@ This project is licensed under the GNU General Public License v3.0 - see the hea
 
 ## Donate
 
-If you find this tool useful, please consider donating:
+If you find this tool useful, please donate:
 - PayPal: https://paypal.me/vr51/
 
 ## Authors
