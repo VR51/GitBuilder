@@ -98,7 +98,7 @@ It's a genuinely useful tool for anyone who builds software from GitHub reposito
 
 3. Optionally, move it to a directory in your PATH:
    ```bash
-   sudo cp gitbuilder /usr/local/bin/
+   sudo cp gitbuilder /usr/local/bin/gitbuilder/
    ```
 
 ## Dependencies
