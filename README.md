@@ -1,6 +1,6 @@
 # GitBuilder - GitHub Repository Manager and Build Automation Tool
 
-**Version 2.0.1**
+**Version 2.0.2**
 
 GitBuilder is a powerful command-line tool for managing GitHub repositories, automating the build process, and launching binaries. It provides a comprehensive solution for developers who frequently work with multiple GitHub projects.
 
@@ -30,23 +30,26 @@ It's a genuinely useful tool for anyone who builds software from GitHub reposito
 ### Build Optimization
 - **Parallel Builds**: Automatic CPU core detection for faster compilation
 - **Build Caching**: Integration with ccache for faster rebuilds
-- **RAM Disk Support**: Optional RAM disk for significantly faster builds
+- **RAM Disk Support**: Dynamic RAM disk (uses up to 75% of available RAM) for significantly faster builds
 - **Debug Symbol Stripping**: Option to strip debug symbols for smaller, faster binaries
 
 ### Advanced Features (New in v2.0)
 - **Build Profiles**: Save and reuse build configurations across repositories
 - **Build Queue**: Queue multiple repositories for sequential building with priority support
 - **Build History**: Track all builds with timestamps, duration, and success/failure status
+- **Build Progress**: Live elapsed time, estimated remaining time, and log activity during builds
 - **Dependency Graph**: Define and track dependencies between repositories
-- **Desktop Notifications**: Get notified when builds complete (requires `notify-send`)
+- **Desktop Notifications**: Get notified immediately when builds complete (requires `notify-send`)
 - **Theme System**: Choose from multiple color themes (default, ocean, forest, mono)
 - **Search & Filter**: Quickly find repositories by name or URL
 - **Backup & Restore**: Export and import your entire database
 - **Help System**: Press H at any menu for instant help
 - **Editor Selection**: Choose your preferred text editor for notes
 - **Binary Versioning**: Backup binaries before rebuilds with automatic rotation (limit: 3)
-- **Desktop Launchers**: Create .desktop files with icon browsing and menu category support
+- **Secondary Binaries**: Track and launch all binaries built by a repository
+- **Desktop Launchers**: Create .desktop files with icon browsing and menu category support, auto-updated on rebuild
 - **Quick Launch**: Press L to quickly launch any registered binary
+- **Auto-Update**: Check for and install GitBuilder updates with one click
 
 ### Import/Export
 - [**gitbuildfile Support**](https://github.com/VR51/GitBuilder/blob/main/README.md#gitbuildfile-support): Save and import build configurations
@@ -131,8 +134,8 @@ The main menu is organized into categories:
 4. **Search existing repositories**: Find repositories by name or URL
 
 **Build Operations**
-5. **Download and build an existing repository**: Clone and build a repository
-6. **Build queue**: Manage queued builds with priority
+5. **Build an existing repository**: Clone and build a repository
+6. **See build queue**: Manage queued builds with priority
 7. **Build profiles**: Create and manage reusable build configurations
 8. **Build history**: View past builds with timestamps and duration
 
@@ -223,10 +226,13 @@ GitBuilder automatically detects and uses the appropriate build system:
 
 After building a project, GitBuilder can:
 - Automatically detect built binaries
+- Store all discovered binaries for later access (secondary binaries)
 - Register them for easy access using an interactive file browser
 - Browse directories and select executable files with a user-friendly interface
 - Launch binaries in either quiet (background) or verbose (terminal output) mode
-- **Prompt to create a desktop launcher** after successful build and binary registration
+- Launch secondary binaries from the build details menu
+- **Prompt to create a desktop launcher** after successful build and binary registration (only if one doesn't exist)
+- **Auto-update desktop launchers** when binary path changes on rebuild
 - Backup existing binaries before rebuilding (with automatic rotation, limit: 3)
 
 ## Build Optimization
@@ -244,6 +250,8 @@ Override with the `GITBUILDER_JOBS` environment variable.
 ### RAM Disk Support
 
 For faster builds, GitBuilder can use a RAM disk:
+- Dynamically allocates up to 75% of available RAM (no hard cap)
+- tmpfs only uses memory as files are written, not pre-allocated
 - Automatically checks available RAM (minimum 2GB required)
 - Mounts a tmpfs filesystem for build operations
 - Copies source to RAM disk before building
