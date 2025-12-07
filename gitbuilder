@@ -3,7 +3,7 @@
 # GitBuilder - GitHub repository management and build automation tool
 # Author: Cascade
 # Prompt Engineer: VR51
-# Version: 2.0.1
+# Version: 2.0.2
 # Created: 2025-04-11
 # Updated: 2025-12-07
 # License: GNU General Public License v3.0
@@ -27,10 +27,13 @@ set -euo pipefail
 set -o noclobber  # Prevent accidental file overwrites
 IFS=$'\n\t'
 
+# Fix backspace/delete key handling in read prompts
+stty erase '^?' 2>/dev/null || true
+
 # =============================================================================
 # VERSION AND HELP
 # =============================================================================
-VERSION="2.0.0"
+VERSION="2.0.2"
 GITHUB_REPO="https://github.com/vr51/GitBuilder"
 
 show_help() {
@@ -120,7 +123,8 @@ CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 # Ensure we have a valid number, default to 4 if detection fails
 [[ ! "$CPU_CORES" =~ ^[0-9]+$ ]] && CPU_CORES=4
 PARALLEL_JOBS="${GITBUILDER_JOBS:-$CPU_CORES}"
-[[ ! "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] && PARALLEL_JOBS=4
+[[ ! "$PARALLEL_JOBS" =~ ^[0-9]+$ || "$PARALLEL_JOBS" -lt 1 ]] && PARALLEL_JOBS=4
+export PARALLEL_JOBS
 
 # RAM disk configuration
 RAMDISK_DIR="$HOME/.local/share/gitbuilder/ramdisk"
@@ -526,6 +530,9 @@ CREATE TABLE IF NOT EXISTS build_history (
     finished_at TEXT,
     success INTEGER,
     duration_seconds INTEGER,
+    download_seconds INTEGER,
+    compile_seconds INTEGER,
+    download_size_bytes INTEGER,
     log_file TEXT,
     build_profile TEXT,
     FOREIGN KEY(repo_id) REFERENCES repositories(id)
@@ -602,6 +609,29 @@ EOF
     
     sqlite3 "$DB_FILE" "PRAGMA table_info(build_configs);" | grep -q "use_ramdisk" || \
         sqlite3 "$DB_FILE" "ALTER TABLE build_configs ADD COLUMN use_ramdisk INTEGER DEFAULT 0;"
+    
+    # Add new build timing columns to build_history
+    sqlite3 "$DB_FILE" "PRAGMA table_info(build_history);" | grep -q "download_seconds" || \
+        sqlite3 "$DB_FILE" "ALTER TABLE build_history ADD COLUMN download_seconds INTEGER;"
+    
+    sqlite3 "$DB_FILE" "PRAGMA table_info(build_history);" | grep -q "compile_seconds" || \
+        sqlite3 "$DB_FILE" "ALTER TABLE build_history ADD COLUMN compile_seconds INTEGER;"
+    
+    sqlite3 "$DB_FILE" "PRAGMA table_info(build_history);" | grep -q "download_size_bytes" || \
+        sqlite3 "$DB_FILE" "ALTER TABLE build_history ADD COLUMN download_size_bytes INTEGER;"
+    
+    # Create secondary_binaries table for storing all discovered binaries
+    sqlite3 "$DB_FILE" <<EOF
+CREATE TABLE IF NOT EXISTS secondary_binaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER NOT NULL,
+    binary_path TEXT NOT NULL,
+    binary_name TEXT,
+    discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(repo_id) REFERENCES repositories(id),
+    UNIQUE(repo_id, binary_path)
+);
+EOF
 }
 
 # Handle errors gracefully
@@ -760,8 +790,9 @@ can_use_ramdisk() {
 }
 
 # Setup RAM disk for building
+# tmpfs dynamically allocates RAM as needed - size is just a soft limit
 setup_ramdisk() {
-    local size_mb="${1:-1024}"
+    local size_mb="${1:-0}"  # 0 means use percentage-based calculation
     
     # Check if already mounted
     if mountpoint -q "$RAMDISK_MOUNT_POINT" 2>/dev/null; then
@@ -770,12 +801,23 @@ setup_ramdisk() {
         return 0
     fi
     
+    # Calculate size if not specified or 0
+    if [ "$size_mb" -eq 0 ] 2>/dev/null || [ -z "$size_mb" ]; then
+        local available_mb
+        available_mb=$(get_available_ram_mb)
+        # Use 75% of available RAM as soft limit (tmpfs only uses what it needs)
+        size_mb=$((available_mb * 75 / 100))
+        # Minimum 1GB, no maximum - let the system manage it
+        [ "$size_mb" -lt 1024 ] && size_mb=1024
+    fi
+    
     # Create mount point directory
     mkdir -p "$RAMDISK_MOUNT_POINT"
     
     # Mount tmpfs (doesn't require root if user has permissions, otherwise use sudo)
+    # Note: tmpfs only allocates RAM as files are written, the size is just a limit
     if mount -t tmpfs -o size=${size_mb}M,mode=0755 tmpfs "$RAMDISK_MOUNT_POINT" 2>/dev/null; then
-        echo -e "${GREEN}RAM disk mounted at $RAMDISK_MOUNT_POINT (${size_mb}MB)${NC}"
+        echo -e "${GREEN}RAM disk mounted at $RAMDISK_MOUNT_POINT (up to ${size_mb}MB available)${NC}"
         RAMDISK_ACTIVE=true
         return 0
     else
@@ -784,7 +826,7 @@ setup_ramdisk() {
         echo -e "${CYAN}Sudo is needed to create a temporary filesystem in RAM for faster builds.${NC}"
         echo -e "${CYAN}This is safe and the RAM disk will be automatically unmounted after the build.${NC}"
         if sudo mount -t tmpfs -o size=${size_mb}M,mode=0755,uid=$(id -u),gid=$(id -g) tmpfs "$RAMDISK_MOUNT_POINT"; then
-            echo -e "${GREEN}RAM disk mounted at $RAMDISK_MOUNT_POINT (${size_mb}MB)${NC}"
+            echo -e "${GREEN}RAM disk mounted at $RAMDISK_MOUNT_POINT (up to ${size_mb}MB available)${NC}"
             RAMDISK_ACTIVE=true
             return 0
         else
@@ -827,20 +869,18 @@ offer_ramdisk() {
     local repo_id="$1"
     local available_mb
     available_mb=$(get_available_ram_mb)
+    local potential_size=$((available_mb * 75 / 100))
     
     if can_use_ramdisk; then
         echo -e "\n${CYAN}RAM Disk Available${NC}"
-        echo -e "Available RAM: ${GREEN}${available_mb}MB${NC} (minimum required: ${RAMDISK_MIN_FREE_MB}MB)"
+        echo -e "Available RAM: ${GREEN}${available_mb}MB${NC} (will use up to ${potential_size}MB as needed)"
         echo -e "Building on RAM disk can significantly speed up compilation."
+        echo -e "${GRAY}Note: tmpfs only uses RAM as files are written, not all at once.${NC}"
         echo ""
         read -rp "Use RAM disk for this build? (y/N): " use_ram
         if [[ "$use_ram" =~ ^[Yy]$ ]]; then
-            # Calculate size: use half of available RAM, max 4GB
-            local size_mb=$((available_mb / 2))
-            [ "$size_mb" -gt 4096 ] && size_mb=4096
-            [ "$size_mb" -lt 512 ] && size_mb=512
-            
-            if setup_ramdisk "$size_mb"; then
+            # Let setup_ramdisk calculate optimal size (75% of available RAM)
+            if setup_ramdisk 0; then
                 return 0
             fi
         fi
@@ -848,6 +888,46 @@ offer_ramdisk() {
         echo -e "${YELLOW}Note: Insufficient RAM for RAM disk build (${available_mb}MB available, ${RAMDISK_MIN_FREE_MB}MB required)${NC}"
     fi
     return 1
+}
+
+# Format duration in seconds to human-readable format (e.g., "5m 32s", "1h 23m")
+format_duration() {
+    local seconds="$1"
+    if [ -z "$seconds" ] || [ "$seconds" -le 0 ] 2>/dev/null; then
+        echo "-"
+        return
+    fi
+    
+    local hours=$((seconds / 3600))
+    local minutes=$(((seconds % 3600) / 60))
+    local secs=$((seconds % 60))
+    
+    if [ "$hours" -gt 0 ]; then
+        printf "%dh %dm" "$hours" "$minutes"
+    elif [ "$minutes" -gt 0 ]; then
+        printf "%dm %ds" "$minutes" "$secs"
+    else
+        printf "%ds" "$secs"
+    fi
+}
+
+# Format bytes to human-readable format (e.g., "1.5 MB", "256 KB")
+format_bytes() {
+    local bytes="$1"
+    if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then
+        echo "-"
+        return
+    fi
+    
+    if [ "$bytes" -ge 1073741824 ]; then
+        printf "%.1f GB" "$(echo "scale=1; $bytes / 1073741824" | bc)"
+    elif [ "$bytes" -ge 1048576 ]; then
+        printf "%.1f MB" "$(echo "scale=1; $bytes / 1048576" | bc)"
+    elif [ "$bytes" -ge 1024 ]; then
+        printf "%.1f KB" "$(echo "scale=1; $bytes / 1024" | bc)"
+    else
+        printf "%d B" "$bytes"
+    fi
 }
 
 # =============================================================================
@@ -866,13 +946,13 @@ fetch_repo_data() {
     local date_format="${1:-full}"
     
     # Reset global arrays
-    _TABLE_HEADERS=("ID" "Name" "URL" "Last Commit" "Last Built" "Binary")
+    _TABLE_HEADERS=("ID" "Name" "URL" "Last Commit" "Last Built" "Duration" "Binary")
     _TABLE_COL_DATA=()
-    _TABLE_NUM_COLS=6
+    _TABLE_NUM_COLS=7
     _TABLE_NUM_ROWS=0
     
     # Temporary arrays for each column
-    local -a tmp_id=() tmp_name=() tmp_url=() tmp_commit=() tmp_built=() tmp_binary=()
+    local -a tmp_id=() tmp_name=() tmp_url=() tmp_commit=() tmp_built=() tmp_duration=() tmp_binary=()
     
     while IFS='|' read -r id name url last_commit last_built binary_path; do
         tmp_id+=("$id")
@@ -905,6 +985,15 @@ fetch_repo_data() {
         fi
         tmp_built+=("$formatted_built")
         
+        # Get last build duration from build_history
+        local duration_seconds
+        duration_seconds=$(sqlite3 "$DB_FILE" "SELECT duration_seconds FROM build_history WHERE repo_id = $id ORDER BY finished_at DESC LIMIT 1;" 2>/dev/null)
+        local formatted_duration="-"
+        if [ -n "$duration_seconds" ] && [ "$duration_seconds" -gt 0 ] 2>/dev/null; then
+            formatted_duration=$(format_duration "$duration_seconds")
+        fi
+        tmp_duration+=("$formatted_duration")
+        
         # Binary status
         local binary_status="No"
         if [ -n "$binary_path" ] && [ -x "$binary_path" ]; then
@@ -923,6 +1012,7 @@ fetch_repo_data() {
     for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_url[i]}"); done
     for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_commit[i]}"); done
     for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_built[i]}"); done
+    for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_duration[i]}"); done
     for ((i=0; i<_TABLE_NUM_ROWS; i++)); do _TABLE_COL_DATA+=("${tmp_binary[i]}"); done
 }
 
@@ -1372,18 +1462,18 @@ find_build_files() {
     mkdir -p "$dir/logs"
     local log_file="$dir/logs/build_detection.log"
     
-    # Log the build detection process
-    echo "Searching for build files in $dir (depth $depth)" > "$log_file"
+    # Log the build detection process (use >| to force overwrite with noclobber)
+    echo "Searching for build files in $dir (depth $depth)" >| "$log_file"
     
-    # Special case for MAME - check if this is the MAME repository
-    if [ -f "$dir/makefile" ] && grep -q "MAMEMESS" "$dir/makefile" 2>/dev/null; then
-        echo "Found MAME makefile in root directory" >> "$log_file"
-        build_files=("$dir/makefile")
+    # Priority 1: CMakeLists.txt in root (highest priority modern build system)
+    if [ -f "$dir/CMakeLists.txt" ]; then
+        echo "Found CMakeLists.txt in root directory" >> "$log_file"
+        build_files=("$dir/CMakeLists.txt")
         echo "${build_files[@]}"
         return 0
     fi
     
-    # First, look specifically for autogen.sh in the root directory
+    # Priority 2: autogen.sh with configure.ac/configure.in (autotools needing generation)
     if [ -x "$dir/autogen.sh" ] && { [ -f "$dir/configure.ac" ] || [ -f "$dir/configure.in" ]; }; then
         echo "Found autogen.sh in root directory" >> "$log_file"
         build_files=("$dir/autogen.sh")
@@ -1391,11 +1481,20 @@ find_build_files() {
         return 0
     fi
     
-    # Check for Makefile in root directory (common for many projects)
+    # Priority 3: configure script (pre-generated autotools)
+    if [ -x "$dir/configure" ]; then
+        echo "Found configure in root directory" >> "$log_file"
+        build_files=("$dir/configure")
+        echo "${build_files[@]}"
+        return 0
+    fi
+    
+    # Priority 4: Makefile/makefile (simple make projects)
     if [ -f "$dir/Makefile" ] || [ -f "$dir/makefile" ]; then
         echo "Found Makefile in root directory" >> "$log_file"
-        build_files=("$dir/Makefile")
-        if [ ! -f "$dir/Makefile" ] && [ -f "$dir/makefile" ]; then
+        if [ -f "$dir/Makefile" ]; then
+            build_files=("$dir/Makefile")
+        else
             build_files=("$dir/makefile")
         fi
         echo "${build_files[@]}"
@@ -1504,12 +1603,6 @@ get_build_type() {
             fi
             ;;
         "Makefile" | "makefile")
-            # Special case for MAME
-            if grep -q "MAMEMESS" "$file" 2>/dev/null; then
-                echo "make|$dirname|MAME build system"
-                return 0
-            fi
-            
             # Don't use Makefile if there's a higher priority build system
             if [ -f "$dirname/CMakeLists.txt" ] || 
                [ -f "$dirname/configure" ] || 
@@ -1767,6 +1860,146 @@ find_binary() {
     # Return binaries one per line instead of space-separated
     for binary in "${binaries[@]}"; do
         echo "$binary"
+    done
+}
+
+# Save all discovered binaries to the database
+save_secondary_binaries() {
+    local repo_id="$1"
+    local dir="$2"
+    local name="$3"
+    
+    # Clear existing secondary binaries for this repo
+    sqlite3 "$DB_FILE" "DELETE FROM secondary_binaries WHERE repo_id = $repo_id;"
+    
+    # Find all binaries
+    local binaries
+    binaries=$(find_binary "$dir" "$name")
+    
+    if [ -z "$binaries" ]; then
+        return 0
+    fi
+    
+    # Save each binary to the database
+    while IFS= read -r binary_path; do
+        [ -z "$binary_path" ] && continue
+        local binary_name
+        binary_name=$(basename "$binary_path")
+        local escaped_path escaped_name
+        escaped_path=$(sql_escape "$binary_path")
+        escaped_name=$(sql_escape "$binary_name")
+        sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO secondary_binaries (repo_id, binary_path, binary_name) VALUES ($repo_id, '$escaped_path', '$escaped_name');"
+    done <<< "$binaries"
+}
+
+# Get secondary binaries for a repository
+get_secondary_binaries() {
+    local repo_id="$1"
+    sqlite3 "$DB_FILE" "SELECT binary_path, binary_name FROM secondary_binaries WHERE repo_id = $repo_id ORDER BY binary_name;"
+}
+
+# Launch secondary binary menu
+launch_secondary_binary_menu() {
+    local repo_id="$1"
+    
+    if ! is_valid_id "$repo_id"; then
+        error "Invalid repository ID"
+        return 1
+    fi
+    
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id AND deleted = 0;")
+    
+    if [ -z "$repo_name" ]; then
+        error "Repository not found"
+        return 1
+    fi
+    
+    while true; do
+        clear
+        echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${CYAN}  Secondary Binaries - $repo_name${NC}"
+        echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        
+        # Get all binaries for this repo
+        local binaries=()
+        local binary_names=()
+        local i=1
+        
+        while IFS='|' read -r path name; do
+            [ -z "$path" ] && continue
+            binaries+=("$path")
+            binary_names+=("$name")
+            
+            # Check if binary exists
+            local status="${GREEN}✓${NC}"
+            [ ! -x "$path" ] && status="${RED}✗${NC}"
+            
+            # Mark primary binary
+            local primary=""
+            local primary_path
+            primary_path=$(sqlite3 "$DB_FILE" "SELECT binary_path FROM repositories WHERE id = $repo_id;")
+            [ "$path" = "$primary_path" ] && primary=" ${YELLOW}(primary)${NC}"
+            
+            echo -e "  $i) $status $name$primary"
+            echo -e "     ${GRAY}$path${NC}"
+            ((i++))
+        done < <(get_secondary_binaries "$repo_id")
+        
+        if [ ${#binaries[@]} -eq 0 ]; then
+            echo -e "  ${YELLOW}No binaries found for this repository.${NC}"
+            echo -e "  ${GRAY}Build the repository first, or use 'Rescan binaries' to find them.${NC}"
+            echo ""
+            echo -e "  R) Rescan for binaries"
+        else
+            echo ""
+            echo -e "  ${GRAY}Enter number to launch, or:${NC}"
+            echo -e "  R) Rescan for binaries"
+        fi
+        
+        echo -e "  ${GRAY}Esc/Enter) Return to build details${NC}"
+        echo ""
+        
+        local choice esc_status=0
+        read_with_esc "Select binary to launch: " choice "" || esc_status=$?
+        
+        # Handle Esc key
+        if [ $esc_status -eq 27 ] || [ -z "$choice" ]; then
+            return 0
+        fi
+        
+        case "$choice" in
+            [Rr])
+                echo -e "${BLUE}Scanning for binaries...${NC}"
+                local src_dir="$SRC_DIR/$repo_name"
+                if [ -d "$src_dir" ]; then
+                    save_secondary_binaries "$repo_id" "$src_dir" "$repo_name"
+                    echo -e "${GREEN}Scan complete.${NC}"
+                    sleep 1
+                else
+                    echo -e "${RED}Source directory not found: $src_dir${NC}"
+                    sleep 2
+                fi
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#binaries[@]}" ]; then
+                    local selected_binary="${binaries[$((choice-1))]}"
+                    if [ -x "$selected_binary" ]; then
+                        echo -e "${GREEN}Launching: $(basename "$selected_binary")${NC}"
+                        nohup "$selected_binary" >/dev/null 2>&1 &
+                        echo -e "${GREEN}Binary launched in background.${NC}"
+                        sleep 1
+                    else
+                        echo -e "${RED}Binary not found or not executable: $selected_binary${NC}"
+                        sleep 2
+                    fi
+                else
+                    echo -e "${RED}Invalid selection${NC}"
+                    sleep 1
+                fi
+                ;;
+        esac
     done
 }
 
@@ -2039,6 +2272,9 @@ handle_build_result() {
         # Capture each line of output as a separate array element
         mapfile -t binaries < <(find_binary "$build_dir" "$name")
         
+        # Save all discovered binaries to database for later access
+        save_secondary_binaries "$repo_id" "$build_dir" "$name"
+        
         if [ ${#binaries[@]} -gt 0 ]; then
             echo -e "\n${BLUE}Found potential binary files:${NC}"
             echo ""
@@ -2094,10 +2330,14 @@ handle_build_result() {
                 launch_binary "$repo_id"
             fi
             
-            # Offer to create desktop launcher
-            read -rp "Would you like to create a desktop launcher? (y/N): " launcher_choice
-            if [[ $launcher_choice =~ ^[Yy]$ ]]; then
-                create_desktop_launcher "$repo_id"
+            # Check desktop launcher - update if exists, offer to create if not
+            if repo_has_desktop_launcher "$repo_id"; then
+                update_desktop_launcher_if_needed "$repo_id"
+            else
+                read -rp "Would you like to create a desktop launcher? (y/N): " launcher_choice
+                if [[ $launcher_choice =~ ^[Yy]$ ]]; then
+                    create_desktop_launcher "$repo_id"
+                fi
             fi
         else
             echo -e "\n${YELLOW}No binaries found automatically.${NC}"
@@ -2124,10 +2364,14 @@ handle_build_result() {
                             launch_binary "$repo_id"
                         fi
                         
-                        # Offer to create desktop launcher
-                        read -rp "Would you like to create a desktop launcher? (y/N): " launcher_choice
-                        if [[ $launcher_choice =~ ^[Yy]$ ]]; then
-                            create_desktop_launcher "$repo_id"
+                        # Check desktop launcher - update if exists, offer to create if not
+                        if repo_has_desktop_launcher "$repo_id"; then
+                            update_desktop_launcher_if_needed "$repo_id"
+                        else
+                            read -rp "Would you like to create a desktop launcher? (y/N): " launcher_choice
+                            if [[ $launcher_choice =~ ^[Yy]$ ]]; then
+                                create_desktop_launcher "$repo_id"
+                            fi
                         fi
                     fi
                 fi
@@ -2146,6 +2390,130 @@ handle_build_result() {
         build_success = $success,
         last_built = datetime('now')
         WHERE id = $repo_id;"
+}
+
+# Clean build cache for a repository directory
+# Removes build artifacts while preserving source files
+clean_build_cache() {
+    local repo_dir="$1"
+    
+    if [ ! -d "$repo_dir" ]; then
+        echo -e "${RED}Directory not found: $repo_dir${NC}"
+        return 1
+    fi
+    
+    cd "$repo_dir" || return 1
+    
+    local cleaned=0
+    
+    # CMake build directories
+    if [ -d "build" ]; then
+        echo -e "  ${CYAN}Removing CMake build directory...${NC}"
+        rm -rf "build"
+        ((cleaned++)) || true
+    fi
+    
+    if [ -d "_build" ]; then
+        echo -e "  ${CYAN}Removing _build directory...${NC}"
+        rm -rf "_build"
+        ((cleaned++)) || true
+    fi
+    
+    # Meson build directory
+    if [ -d "builddir" ]; then
+        echo -e "  ${CYAN}Removing Meson builddir...${NC}"
+        rm -rf "builddir"
+        ((cleaned++)) || true
+    fi
+    
+    # Autotools generated files
+    if [ -f "Makefile" ] && [ -f "configure" ]; then
+        echo -e "  ${CYAN}Running make clean...${NC}"
+        make clean 2>/dev/null || true
+        make distclean 2>/dev/null || true
+        ((cleaned++)) || true
+    fi
+    
+    # Object files and libraries
+    local obj_count
+    obj_count=$(find . -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.lo" -o -name "*.la" 2>/dev/null | wc -l)
+    if [ "$obj_count" -gt 0 ]; then
+        echo -e "  ${CYAN}Removing $obj_count object/library files...${NC}"
+        find . -name "*.o" -delete 2>/dev/null || true
+        find . -name "*.a" -delete 2>/dev/null || true
+        find . -name "*.so" -delete 2>/dev/null || true
+        find . -name "*.lo" -delete 2>/dev/null || true
+        find . -name "*.la" -delete 2>/dev/null || true
+        ((cleaned++)) || true
+    fi
+    
+    # Libtool directories
+    if [ -d ".libs" ] || find . -type d -name ".libs" 2>/dev/null | grep -q .; then
+        echo -e "  ${CYAN}Removing .libs directories...${NC}"
+        find . -type d -name ".libs" -exec rm -rf {} + 2>/dev/null || true
+        ((cleaned++)) || true
+    fi
+    
+    # Autotools cache
+    if [ -d "autom4te.cache" ]; then
+        echo -e "  ${CYAN}Removing autom4te.cache...${NC}"
+        rm -rf "autom4te.cache"
+        ((cleaned++)) || true
+    fi
+    
+    # CMake cache files
+    if [ -f "CMakeCache.txt" ]; then
+        echo -e "  ${CYAN}Removing CMake cache...${NC}"
+        rm -f CMakeCache.txt
+        rm -rf CMakeFiles
+        ((cleaned++)) || true
+    fi
+    
+    # Python build artifacts
+    if [ -d "__pycache__" ] || [ -d "build" ] || [ -d "dist" ] || [ -d "*.egg-info" ]; then
+        echo -e "  ${CYAN}Removing Python build artifacts...${NC}"
+        find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+        find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+        rm -rf dist 2>/dev/null || true
+        ((cleaned++)) || true
+    fi
+    
+    # Node.js
+    if [ -d "node_modules" ]; then
+        echo -e "  ${CYAN}Removing node_modules...${NC}"
+        rm -rf "node_modules"
+        ((cleaned++)) || true
+    fi
+    
+    # Gradle
+    if [ -d ".gradle" ]; then
+        echo -e "  ${CYAN}Removing Gradle cache...${NC}"
+        rm -rf ".gradle"
+        rm -rf "build" 2>/dev/null || true
+        ((cleaned++)) || true
+    fi
+    
+    # Maven
+    if [ -d "target" ]; then
+        echo -e "  ${CYAN}Removing Maven target directory...${NC}"
+        rm -rf "target"
+        ((cleaned++)) || true
+    fi
+    
+    # Rust
+    if [ -d "target" ] && [ -f "Cargo.toml" ]; then
+        echo -e "  ${CYAN}Removing Rust target directory...${NC}"
+        rm -rf "target"
+        ((cleaned++)) || true
+    fi
+    
+    if [ "$cleaned" -eq 0 ]; then
+        echo -e "  ${YELLOW}No build cache found to clean${NC}"
+    else
+        echo -e "  ${GREEN}Cleaned $cleaned build artifact type(s)${NC}"
+    fi
+    
+    return 0
 }
 
 # Execute build command with timeout and progress
@@ -2173,13 +2541,30 @@ execute_build() {
     local configure_flags make_flags cmake_flags dependencies strip_debug use_ramdisk
     IFS='|' read -r configure_flags make_flags cmake_flags dependencies strip_debug use_ramdisk < <(get_build_config "$repo_id")
     
+    # Ensure PARALLEL_JOBS has a valid value (must be done before string interpolation)
+    if [[ ! "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [ -z "$PARALLEL_JOBS" ] || [ "$PARALLEL_JOBS" -lt 1 ] 2>/dev/null; then
+        PARALLEL_JOBS=4
+    fi
+    
+    # Remove any malformed -j flags (e.g., "-j" without a number, or "-j ")
+    make_flags=$(echo "$make_flags" | sed -E 's/-j[[:space:]]*([^0-9]|$)//g')
+    
+    # Build the jobs flag with explicit number
+    local jobs_flag="-j$PARALLEL_JOBS"
+    
     # Add parallel jobs flag if not already specified in make_flags
     if [[ ! "$make_flags" =~ -j[[:space:]]*[0-9]+ ]]; then
-        make_flags="-j${PARALLEL_JOBS} ${make_flags}"
+        if [ -n "$make_flags" ] && [ "$make_flags" != " " ]; then
+            make_flags="$jobs_flag $make_flags"
+        else
+            make_flags="$jobs_flag"
+        fi
     fi
     # Trim any leading/trailing whitespace from make_flags
     make_flags="${make_flags## }"
     make_flags="${make_flags%% }"
+    # Final safety check - if make_flags is empty or just whitespace, set to jobs_flag
+    [[ -z "${make_flags// }" ]] && make_flags="$jobs_flag"
     
     # Handle strip debug symbols option
     local cflags_extra=""
@@ -2191,13 +2576,8 @@ execute_build() {
     # Handle RAM disk option
     local actual_build_dir="$dir"
     if [ "$use_ramdisk" = "1" ] && can_use_ramdisk; then
-        local available_mb
-        available_mb=$(get_available_ram_mb)
-        local size_mb=$((available_mb / 2))
-        [ "$size_mb" -gt 4096 ] && size_mb=4096
-        [ "$size_mb" -lt 512 ] && size_mb=512
-        
-        if setup_ramdisk "$size_mb"; then
+        # Let setup_ramdisk calculate optimal size (75% of available RAM)
+        if setup_ramdisk 0; then
             actual_build_dir="$RAMDISK_MOUNT_POINT"
             echo -e "${CYAN}Building on RAM disk for faster compilation${NC}"
             # Copy source to RAM disk
@@ -2211,174 +2591,182 @@ execute_build() {
     name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;")
     
     echo -e "\n${BLUE}Building with $type using ${PARALLEL_JOBS} parallel jobs...${NC}"
+    echo -e "${GRAY}Make flags: $make_flags${NC}"
     echo "Build output will be saved to: $log_file"
+    echo "View in terminal: tail -f $log_file"
     
-    # Set up CFLAGS for optimized builds
-    local cflags_env=""
-    if [ -n "$cflags_extra" ]; then
-        cflags_env="CFLAGS=\"$cflags_extra\" CXXFLAGS=\"$cflags_extra\""
-    fi
-    
-    # Special handling for Atari800
-    if [ "$name" = "Atari800" ]; then
-        echo -e "${BLUE}Detected Atari800 - using special build process...${NC}"
+    # Create a subshell to maintain directory state and run the build
+    (
+        # Unset MAKEFLAGS to prevent -j conflicts with recursive makes
+        unset MAKEFLAGS
+        # Export CFLAGS if stripping debug
+        [ -n "$cflags_extra" ] && export CFLAGS="$cflags_extra" CXXFLAGS="$cflags_extra"
         
-        # Create a subshell to maintain directory state
-        (
-            cd "$actual_build_dir" || exit 1
-            
-            # Export CFLAGS if stripping debug
-            [ -n "$cflags_extra" ] && export CFLAGS="$cflags_extra" CXXFLAGS="$cflags_extra"
-            
-            # Run the build process
-            {
-                echo "Running autogen.sh..." >> "$log_file"
-                ./autogen.sh >> "$log_file" 2>&1 || exit 1
+        case "$type" in
+            "cmake")
+                # Create build directory if it doesn't exist
+                build_dir="$actual_build_dir/build"
+                mkdir -p "$build_dir"
+                cd "$build_dir" || exit 1
                 
-                echo "Running configure..." >> "$log_file"
-                ./configure ${args[@]:-} $configure_flags >> "$log_file" 2>&1 || exit 1
+                # Run cmake with progress (add release type if stripping debug)
+                local cmake_build_type=""
+                [ -n "$cflags_extra" ] && cmake_build_type="-DCMAKE_BUILD_TYPE=Release"
+                {
+                    cmake ${args[@]:-} $cmake_flags $cmake_build_type .. && \
+                    eval "make $make_flags"
+                } > "$log_file" 2>&1
+                ;;
                 
-                echo "Running make..." >> "$log_file"
-                make $make_flags
-            } > "$log_file" 2>&1
-        ) &
-    else
-        # Create a subshell to maintain directory state
-        (
-            # Export CFLAGS if stripping debug
-            [ -n "$cflags_extra" ] && export CFLAGS="$cflags_extra" CXXFLAGS="$cflags_extra"
-            
-            case "$type" in
-                "cmake")
-                    # Create build directory if it doesn't exist
-                    build_dir="$actual_build_dir/build"
-                    mkdir -p "$build_dir"
-                    cd "$build_dir" || exit 1
+            "autogen")
+                cd "$actual_build_dir" || exit 1
+                
+                # Run autogen.sh, configure, and make
+                {
+                    echo "Running autogen.sh..." >> "$log_file"
+                    ./autogen.sh >> "$log_file" 2>&1 || exit 1
                     
-                    # Run cmake with progress (add release type if stripping debug)
-                    local cmake_build_type=""
-                    [ -n "$cflags_extra" ] && cmake_build_type="-DCMAKE_BUILD_TYPE=Release"
-                    {
-                        cmake ${args[@]:-} $cmake_flags $cmake_build_type .. && \
-                        make $make_flags
-                    } > "$log_file" 2>&1
-                    ;;
+                    echo "Running configure..." >> "$log_file"
+                    ./configure ${args[@]:-} $configure_flags >> "$log_file" 2>&1 || exit 1
                     
-                "autogen")
-                    cd "$actual_build_dir" || exit 1
+                    echo "Running make..." >> "$log_file"
+                    eval "make $make_flags"
+                } > "$log_file" 2>&1
+                ;;
+                
+            "autotools" | "custom-configure")
+                cd "$actual_build_dir" || exit 1
+                
+                # Run configure and make
+                {
+                    echo "Running configure..." >> "$log_file"
+                    ./configure ${args[@]:-} $configure_flags >> "$log_file" 2>&1 || exit 1
                     
-                    # Run autogen.sh, configure, and make
-                    {
-                        echo "Running autogen.sh..." >> "$log_file"
-                        ./autogen.sh >> "$log_file" 2>&1 || exit 1
-                        
-                        echo "Running configure..." >> "$log_file"
-                        ./configure ${args[@]:-} $configure_flags >> "$log_file" 2>&1 || exit 1
-                        
-                        echo "Running make..." >> "$log_file"
-                        make $make_flags
-                    } > "$log_file" 2>&1
-                    ;;
-                    
-                "autotools" | "custom-configure")
-                    cd "$actual_build_dir" || exit 1
-                    
-                    # Run configure and make
-                    {
-                        echo "Running configure..." >> "$log_file"
-                        ./configure ${args[@]:-} $configure_flags >> "$log_file" 2>&1 || exit 1
-                        
-                        echo "Running make..." >> "$log_file"
-                        make $make_flags
-                    } > "$log_file" 2>&1
-                    ;;
-                    
-                "make")
-                    cd "$actual_build_dir" || exit 1
-                    
-                    # Special handling for MAME
-                    if [ -f "makefile" ] && grep -q "MAMEMESS" "makefile" 2>/dev/null; then
-                        echo "Building MAME..." >> "$log_file"
-                        # MAME typically needs specific targets
-                        make $make_flags > "$log_file" 2>&1
+                    echo "Running make..." >> "$log_file"
+                    eval "make $make_flags"
+                } > "$log_file" 2>&1
+                ;;
+                
+            "make")
+                cd "$actual_build_dir" || exit 1
+                eval "make $make_flags" > "$log_file" 2>&1
+                ;;
+                
+            "gradle")
+                cd "$actual_build_dir" || exit 1
+                {
+                    echo "Running gradle build with ${PARALLEL_JOBS} workers..." >> "$log_file"
+                    if [ -x "./gradlew" ]; then
+                        echo "Using Gradle wrapper..." >> "$log_file"
+                        ./gradlew build --parallel --max-workers=${PARALLEL_JOBS}
+                    elif command -v gradle >/dev/null 2>&1; then
+                        echo "Using system Gradle..." >> "$log_file"
+                        gradle build --parallel --max-workers=${PARALLEL_JOBS}
                     else
-                        # Regular make build
-                        make $make_flags > "$log_file" 2>&1
+                        echo "Error: Neither Gradle wrapper nor system Gradle found" >> "$log_file"
+                        exit 1
                     fi
-                    ;;
-                    
-                "gradle")
-                    cd "$actual_build_dir" || exit 1
-                    {
-                        echo "Running gradle build with ${PARALLEL_JOBS} workers..." >> "$log_file"
-                        # Check if gradlew exists and is executable
-                        if [ -x "./gradlew" ]; then
-                            echo "Using Gradle wrapper..." >> "$log_file"
-                            ./gradlew build --parallel --max-workers=${PARALLEL_JOBS}
-                        elif command -v gradle >/dev/null 2>&1; then
-                            echo "Using system Gradle..." >> "$log_file"
-                            gradle build --parallel --max-workers=${PARALLEL_JOBS}
-                        else
-                            echo "Error: Neither Gradle wrapper nor system Gradle found" >> "$log_file"
-                            exit 1
-                        fi
-                    } > "$log_file" 2>&1
-                    ;;
-                    
-                "maven")
-                    cd "$actual_build_dir" || exit 1
-                    {
-                        echo "Running maven build with ${PARALLEL_JOBS} threads..." >> "$log_file"
-                        mvn clean install -T ${PARALLEL_JOBS}
-                    } > "$log_file" 2>&1
-                    ;;
-                    
-                "python")
-                    cd "$actual_build_dir" || exit 1
-                    {
-                        echo "Building Python package..." >> "$log_file"
-                        python setup.py build
-                    } > "$log_file" 2>&1
-                    ;;
-                    
-                "node")
-                    cd "$actual_build_dir" || exit 1
-                    {
-                        echo "Building Node.js package..." >> "$log_file"
-                        npm install && npm run build
-                    } > "$log_file" 2>&1
-                    ;;
-                    
-                "meson")
-                    cd "$actual_build_dir" || exit 1
-                    {
-                        echo "Running meson build with ${PARALLEL_JOBS} jobs..." >> "$log_file"
-                        local meson_buildtype=""
-                        [ -n "$cflags_extra" ] && meson_buildtype="--buildtype=release"
-                        meson build $meson_buildtype && cd build && ninja -j ${PARALLEL_JOBS}
-                    } > "$log_file" 2>&1
-                    ;;
-                    
-                *)
-                    error "Unknown build type: $type"
-                    exit 1
-                    ;;
-            esac
-        ) &
-    fi
+                } > "$log_file" 2>&1
+                ;;
+                
+            "maven")
+                cd "$actual_build_dir" || exit 1
+                {
+                    echo "Running maven build with ${PARALLEL_JOBS} threads..." >> "$log_file"
+                    mvn clean install -T ${PARALLEL_JOBS}
+                } > "$log_file" 2>&1
+                ;;
+                
+            "python")
+                cd "$actual_build_dir" || exit 1
+                {
+                    echo "Building Python package..." >> "$log_file"
+                    python setup.py build
+                } > "$log_file" 2>&1
+                ;;
+                
+            "node")
+                cd "$actual_build_dir" || exit 1
+                {
+                    echo "Building Node.js package..." >> "$log_file"
+                    npm install && npm run build
+                } > "$log_file" 2>&1
+                ;;
+                
+            "meson")
+                cd "$actual_build_dir" || exit 1
+                {
+                    echo "Running meson build with ${PARALLEL_JOBS} jobs..." >> "$log_file"
+                    local meson_buildtype=""
+                    [ -n "$cflags_extra" ] && meson_buildtype="--buildtype=release"
+                    meson build $meson_buildtype && cd build && ninja -j ${PARALLEL_JOBS}
+                } > "$log_file" 2>&1
+                ;;
+                
+            *)
+                error "Unknown build type: $type"
+                exit 1
+                ;;
+        esac
+    ) &
     
     # Get the background process ID
     local pid=$!
     
-    # Show progress while building
-    local dots=""
+    # Get previous build duration for this repo (for estimate)
+    local prev_duration
+    prev_duration=$(sqlite3 "$DB_FILE" "SELECT compile_seconds FROM build_history WHERE repo_id = $repo_id AND success = 0 ORDER BY finished_at DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$prev_duration" ] || [ "$prev_duration" = "0" ] && prev_duration=""
+    
+    # Format previous duration for display
+    local prev_duration_str=""
+    if [ -n "$prev_duration" ]; then
+        prev_duration_str=$(format_duration "$prev_duration")
+    fi
+    
+    # Show progress while building with elapsed time
+    local elapsed=0
+    local spinner_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local spinner_len=${#spinner_chars}
+    
     while kill -0 $pid 2>/dev/null; do
-        echo -ne "\r${YELLOW}Building${dots}${NC}   "
-        dots="$dots."
-        [ ${#dots} -gt 3 ] && dots=""
+        local spinner_char="${spinner_chars:$((elapsed % spinner_len)):1}"
+        local elapsed_str=$(format_duration "$elapsed")
+        local log_lines=""
+        
+        # Get log file line count for activity indicator
+        if [ -f "$log_file" ]; then
+            log_lines=$(wc -l < "$log_file" 2>/dev/null || echo "0")
+        fi
+        
+        # Build progress line
+        local progress_line="${YELLOW}${spinner_char} Building...${NC} ${elapsed_str}"
+        
+        # Add estimate if we have previous build time
+        if [ -n "$prev_duration_str" ]; then
+            local remaining=$((prev_duration - elapsed))
+            if [ $remaining -gt 0 ]; then
+                local remaining_str=$(format_duration "$remaining")
+                progress_line="$progress_line ${GRAY}(~${remaining_str} remaining, prev: ${prev_duration_str})${NC}"
+            else
+                local overtime=$((elapsed - prev_duration))
+                local overtime_str=$(format_duration "$overtime")
+                progress_line="$progress_line ${GRAY}(+${overtime_str} over prev: ${prev_duration_str})${NC}"
+            fi
+        fi
+        
+        # Add log line count
+        if [ -n "$log_lines" ] && [ "$log_lines" != "0" ]; then
+            progress_line="$progress_line ${GRAY}[${log_lines} lines]${NC}"
+        fi
+        
+        # Clear line and print progress
+        echo -ne "\r\033[K${progress_line}"
+        
         sleep 1
+        ((elapsed++))
     done
-    echo -ne "\r"
+    echo -ne "\r\033[K"
     
     # Check if build succeeded
     wait $pid
@@ -2398,19 +2786,21 @@ execute_build() {
     
     if [ $status -eq 0 ]; then
         echo -e "${GREEN}Build completed successfully!${NC}"
+        # Send notification immediately so user knows to respond to prompts
+        send_notification "Build Complete" "$name built successfully"
         # Record in build history
         record_build_history "$repo_id" 0 "$log_file" "$build_start_time"
+        # Handle post-build prompts (binary selection, launcher, etc.)
         handle_build_result "$repo_id" "$dir" 0 "$log_file"
-        # Send notification
-        send_notification "Build Complete" "$name built successfully"
         return 0
     else
         echo -e "${RED}Build failed!${NC}"
+        # Send notification immediately
+        send_notification "Build Failed" "$name build failed"
         # Record in build history
         record_build_history "$repo_id" 1 "$log_file" "$build_start_time"
+        # Handle post-build prompts (view log, etc.)
         handle_build_result "$repo_id" "$dir" 1 "$log_file"
-        # Send notification
-        send_notification "Build Failed" "$name build failed"
         return 1
     fi
 }
@@ -2693,11 +3083,15 @@ download_build() {
     
     local repo_dir="$SRC_DIR/$name"
     
+    # Track download timing
+    local download_start_time download_end_time download_seconds=0 download_size=0
+    
     if [ -d "$repo_dir" ]; then
         echo -e "\n${BLUE}Repository already exists locally.${NC}"
         echo "1) Use existing repository and update it"
-        echo "2) Delete existing repository and clone fresh"
-        echo "3) Cancel"
+        echo "2) Clean build cache and rebuild fresh"
+        echo "3) Delete existing repository and clone fresh"
+        echo "4) Cancel"
         
         read -rp "Select an option: " choice
         case $choice in
@@ -2707,21 +3101,34 @@ download_build() {
                     error "Failed to access repository directory: $repo_dir"
                     return 1
                 }
+                download_start_time=$(date +%s)
                 if ! git pull; then
                     error "Failed to update repository"
                     return 1
                 fi
+                download_end_time=$(date +%s)
+                download_seconds=$((download_end_time - download_start_time))
                 ;;
             2)
+                echo "Cleaning build cache..."
+                clean_build_cache "$repo_dir"
+                echo -e "${GREEN}Build cache cleaned. Ready for fresh build.${NC}"
+                ;;
+            3)
                 echo "Deleting existing repository..."
                 rm -rf "$repo_dir"
                 echo "Cloning repository..."
+                download_start_time=$(date +%s)
                 if ! git clone "$url" "$name"; then
                     error "Failed to clone repository"
                     return 1
                 fi
+                download_end_time=$(date +%s)
+                download_seconds=$((download_end_time - download_start_time))
+                # Calculate download size
+                download_size=$(du -sb "$repo_dir" 2>/dev/null | cut -f1)
                 ;;
-            3)
+            4)
                 echo "Operation cancelled"
                 return 0
                 ;;
@@ -2732,11 +3139,20 @@ download_build() {
         esac
     else
         echo "Cloning repository..."
+        download_start_time=$(date +%s)
         if ! git clone "$url" "$name"; then
             error "Failed to clone repository"
             return 1
         fi
+        download_end_time=$(date +%s)
+        download_seconds=$((download_end_time - download_start_time))
+        # Calculate download size
+        download_size=$(du -sb "$repo_dir" 2>/dev/null | cut -f1)
     fi
+    
+    # Store download metrics for later use in build_package
+    export _BUILD_DOWNLOAD_SECONDS="$download_seconds"
+    export _BUILD_DOWNLOAD_SIZE="$download_size"
     
     # Check for gitbuildfile and prompt user before using it
     local gitbuildfile="$repo_dir/gitbuildfile"
@@ -2796,7 +3212,7 @@ show_build_details() {
     fi
     
     while true; do
-        show_standard_layout
+        show_standard_layout "Repository Details" false
         
         # Get repository details
         local repo_info
@@ -2882,16 +3298,54 @@ show_build_details() {
         echo -e "16) ${YELLOW}Strip debug symbols:${NC} $strip_debug_status"
         echo -e "17) ${YELLOW}Use RAM disk:${NC}        $use_ramdisk_status"
         
+        # Get build statistics from build_history
+        local build_stats
+        build_stats=$(sqlite3 "$DB_FILE" "SELECT duration_seconds, download_seconds, compile_seconds, download_size_bytes FROM build_history WHERE repo_id = $repo_id ORDER BY finished_at DESC LIMIT 1;" 2>/dev/null)
+        if [ -n "$build_stats" ]; then
+            local last_duration last_download last_compile last_size
+            IFS='|' read -r last_duration last_download last_compile last_size <<< "$build_stats"
+            
+            # Get average build times
+            local avg_stats
+            avg_stats=$(sqlite3 "$DB_FILE" "SELECT AVG(duration_seconds), AVG(download_seconds), AVG(compile_seconds), COUNT(*) FROM build_history WHERE repo_id = $repo_id AND success = 0;" 2>/dev/null)
+            local avg_duration avg_download avg_compile build_count
+            IFS='|' read -r avg_duration avg_download avg_compile build_count <<< "$avg_stats"
+            
+            echo -e "\n${BLUE}Build Statistics${NC}"
+            echo -e "    ${YELLOW}Last build duration:${NC}  $(format_duration "${last_duration:-0}")"
+            echo -e "    ${YELLOW}  - Download time:${NC}    $(format_duration "${last_download:-0}")"
+            echo -e "    ${YELLOW}  - Compile time:${NC}     $(format_duration "${last_compile:-0}")"
+            echo -e "    ${YELLOW}  - Download size:${NC}    $(format_bytes "${last_size:-0}")"
+            if [ "${build_count:-0}" -gt 1 ]; then
+                echo -e "    ${YELLOW}Average build time:${NC}   $(format_duration "${avg_duration%.*}")"
+                echo -e "    ${YELLOW}Total builds:${NC}         ${build_count:-0}"
+            fi
+        fi
+        
+        # Check if desktop launcher exists for this repo
+        local has_launcher=false
+        repo_has_desktop_launcher "$repo_id" && has_launcher=true
+        
         echo -e "\n${BLUE}Actions${NC}"
         echo -e "18) Rebuild repository"
         echo -e "19) Launch binary"
         echo -e "20) Binary backups"
-        echo -e "21) Create desktop launcher"
+        echo -e "21) Launch secondary binary"
+        if [ "$has_launcher" = true ]; then
+            echo -e "22) Remove desktop launcher"
+        else
+            echo -e "22) Create desktop launcher"
+        fi
+        echo -e "23) View build errors"
+        echo -e "24) View build warnings"
+        echo -e "25) View missing dependencies"
+        echo -e "26) View full build log"
+        echo -e "27) Clear build log files"
         
         # Get user choice with hotkey support (H for help, L for launch)
         echo
         local esc_status=0
-        read_with_esc "Select option (1-21): " choice "HLG" || esc_status=$?
+        read_with_esc "Select editable option (1-27): " choice "HLG" || esc_status=$?
         
         # Handle hotkeys
         case $esc_status in
@@ -3133,8 +3587,30 @@ show_build_details() {
             20) # Binary backups
                 binary_backups_menu "$repo_id"
                 ;;
-            21) # Create desktop launcher
-                create_desktop_launcher "$repo_id"
+            21) # Launch secondary binary
+                launch_secondary_binary_menu "$repo_id"
+                ;;
+            22) # Create/Remove desktop launcher
+                if [ "$has_launcher" = true ]; then
+                    delete_desktop_launcher "$repo_id"
+                else
+                    create_desktop_launcher "$repo_id"
+                fi
+                ;;
+            23) # View build errors
+                view_build_log_filtered "$repo_id" "errors"
+                ;;
+            24) # View build warnings
+                view_build_log_filtered "$repo_id" "warnings"
+                ;;
+            25) # View missing dependencies
+                view_build_log_filtered "$repo_id" "missing_deps"
+                ;;
+            26) # View full build log
+                view_full_build_log "$repo_id"
+                ;;
+            27) # Clear build log files
+                clear_build_log_files "$repo_id"
                 ;;
             *) 
                 echo -e "${RED}Invalid option${NC}"
@@ -3144,10 +3620,184 @@ show_build_details() {
     done
 }
 
+# View full build log for a repository
+view_full_build_log() {
+    local repo_id="$1"
+    
+    # Get the most recent log file
+    local log_file
+    log_file=$(sqlite3 "$DB_FILE" "SELECT log_file FROM build_history WHERE repo_id = $repo_id ORDER BY finished_at DESC LIMIT 1;" 2>/dev/null)
+    
+    if [ -z "$log_file" ] || [ ! -f "$log_file" ]; then
+        echo -e "${YELLOW}No build log found for this repository.${NC}"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    less "$log_file"
+}
+
+# Clear build log files for a repository (keeps database records)
+clear_build_log_files() {
+    local repo_id="$1"
+    
+    # Get repository name
+    local repo_name
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;" 2>/dev/null)
+    
+    # Get all log files for this repository
+    local log_files
+    log_files=$(sqlite3 "$DB_FILE" "SELECT log_file FROM build_history WHERE repo_id = $repo_id AND log_file IS NOT NULL;" 2>/dev/null)
+    
+    if [ -z "$log_files" ]; then
+        echo -e "${YELLOW}No build logs found for this repository.${NC}"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    # Count log files
+    local log_count=0
+    local total_size=0
+    while IFS= read -r log_file; do
+        if [ -f "$log_file" ]; then
+            ((log_count++)) || true
+            local file_size
+            file_size=$(stat -c%s "$log_file" 2>/dev/null || echo 0)
+            total_size=$((total_size + file_size))
+        fi
+    done <<< "$log_files"
+    
+    if [ "$log_count" -eq 0 ]; then
+        echo -e "${YELLOW}No build log files found on disk.${NC}"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    echo -e "${BLUE}Clear Build Log Files${NC}"
+    echo "============================================"
+    echo -e "Repository: ${CYAN}$repo_name${NC}"
+    echo -e "Log files found: ${YELLOW}$log_count${NC}"
+    echo -e "Total size: ${YELLOW}$(format_bytes $total_size)${NC}"
+    echo ""
+    echo -e "${YELLOW}Note: This will delete log files from disk but keep build history records in the database.${NC}"
+    echo ""
+    
+    read -rp "Delete all log files for this repository? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Operation cancelled${NC}"
+        read -rp "Press Enter to continue..."
+        return 0
+    fi
+    
+    # Delete the log files
+    local deleted=0
+    while IFS= read -r log_file; do
+        if [ -f "$log_file" ]; then
+            if rm -f "$log_file" 2>/dev/null; then
+                ((deleted++)) || true
+            fi
+        fi
+    done <<< "$log_files"
+    
+    # Also try to clean up empty log directories
+    local repo_dir
+    repo_dir=$(sqlite3 "$DB_FILE" "SELECT url FROM repositories WHERE id = $repo_id;" 2>/dev/null)
+    repo_dir="$SRC_DIR/$repo_name/logs"
+    if [ -d "$repo_dir" ] && [ -z "$(ls -A "$repo_dir" 2>/dev/null)" ]; then
+        rmdir "$repo_dir" 2>/dev/null || true
+    fi
+    
+    echo -e "${GREEN}Deleted $deleted log file(s)${NC}"
+    read -rp "Press Enter to continue..."
+}
+
+# View build log filtered for errors, warnings, or missing dependencies
+view_build_log_filtered() {
+    local repo_id="$1"
+    local filter_type="$2"
+    
+    # Get the most recent log file
+    local log_file
+    log_file=$(sqlite3 "$DB_FILE" "SELECT log_file FROM build_history WHERE repo_id = $repo_id ORDER BY finished_at DESC LIMIT 1;" 2>/dev/null)
+    
+    if [ -z "$log_file" ] || [ ! -f "$log_file" ]; then
+        echo -e "${YELLOW}No build log found for this repository.${NC}"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    clear
+    local title pattern
+    case "$filter_type" in
+        "errors")
+            title="Build Errors"
+            # Common error patterns across build systems
+            pattern="error:|Error:|ERROR:|fatal:|FATAL:|undefined reference|cannot find|No such file|failed|FAILED|make\[.*\]: \*\*\*"
+            ;;
+        "warnings")
+            title="Build Warnings"
+            # Common warning patterns
+            pattern="warning:|Warning:|WARNING:|deprecated|DEPRECATED"
+            ;;
+        "missing_deps")
+            title="Missing Dependencies"
+            # Patterns for missing packages/libraries
+            pattern="Package .* was not found|could not find|not found|No package .* found|cannot find -l|missing:|requires|dependency|configure: error:|CMake Error.*find_package|unable to locate"
+            ;;
+        *)
+            title="Build Log"
+            pattern="."
+            ;;
+    esac
+    
+    echo -e "${BLUE}$title${NC}"
+    echo "============================================"
+    echo -e "Log file: ${CYAN}$log_file${NC}"
+    echo ""
+    
+    local matches
+    matches=$(grep -iE "$pattern" "$log_file" 2>/dev/null | head -100)
+    
+    if [ -z "$matches" ]; then
+        echo -e "${GREEN}No $filter_type found in the build log.${NC}"
+    else
+        echo -e "${YELLOW}Found the following $filter_type:${NC}"
+        echo ""
+        echo "$matches" | while IFS= read -r line; do
+            # Colorize based on type
+            case "$filter_type" in
+                "errors")
+                    echo -e "${RED}$line${NC}"
+                    ;;
+                "warnings")
+                    echo -e "${YELLOW}$line${NC}"
+                    ;;
+                "missing_deps")
+                    echo -e "${MAGENTA}$line${NC}"
+                    ;;
+                *)
+                    echo "$line"
+                    ;;
+            esac
+        done
+        
+        local count
+        count=$(grep -ciE "$pattern" "$log_file" 2>/dev/null || echo "0")
+        echo ""
+        echo -e "${GRAY}Showing up to 100 of $count matches${NC}"
+    fi
+    
+    echo ""
+    read -rp "Press Enter to continue (or 'v' to view full log): " view_choice
+    if [[ "$view_choice" =~ ^[Vv]$ ]]; then
+        less "$log_file"
+    fi
+}
+
 # Display repositories table with full date format
 show_repos() {
     fetch_repo_data "full"
-    render_table "Available Repositories:" "2|8|10|10|10|3"
+    render_table "Available Repositories:" "2|8|10|10|10|6|3"
 }
 
 # Launch binary
@@ -3909,8 +4559,8 @@ main_menu() {
         echo ""
         echo -e "${CYAN}Build Operations${NC}"
         echo -e "${GRAY}Help: G + 3${NC}"
-        echo "5) Download and build an existing repository"
-        echo "6) Build queue"
+        echo "5) Build an existing repository"
+        echo "6) See build queue"
         echo "7) Build profiles"
         echo "8) Build history"
         echo ""
@@ -3923,7 +4573,7 @@ main_menu() {
         echo ""
         echo -e "${CYAN}Import/Export${NC}"
         echo -e "${GRAY}Help: G + 5${NC}"
-        echo "13) Save gitbuildfile"
+        echo "13) Save a gitbuildfile"
         echo "14) Save all gitbuildfiles"
         echo "15) Import gitbuildfile"
         echo ""
@@ -3936,6 +4586,7 @@ main_menu() {
         else
             echo "18) Remove GitBuilder desktop launcher"
         fi
+        echo "19) Restart GitBuilder"
         
         # Read input with hotkey support
         echo ""
@@ -4019,6 +4670,12 @@ main_menu() {
                     remove_gitbuilder_launcher
                 fi
                 ;;
+            19) # Restart GitBuilder
+                echo -e "${CYAN}Restarting GitBuilder...${NC}"
+                local script_path
+                script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+                exec "$script_path" "$@"
+                ;;
             *) 
                 echo -e "${RED}Invalid option${NC}"
                 sleep 1
@@ -4035,7 +4692,7 @@ get_console_width() {
 # Display repository table in top pane (compact format with short dates)
 show_repository_table() {
     fetch_repo_data "short"
-    render_table "Available Repositories:" "2|8|20|5|5|3"
+    render_table "Available Repositories:" "2|8|20|5|5|6|3"
 }
 
 # Read input with immediate Esc key detection and hotkey support
@@ -4051,8 +4708,8 @@ read_with_esc() {
 	
 	echo -n "$prompt"
 	
-	# Read character by character; rely on the terminal's normal echo
-	while IFS= read -r -n1 char; do
+	# Read character by character with -s to suppress auto-echo (we handle echo manually)
+	while IFS= read -r -s -n1 char; do
 		# Check for Esc key (ASCII 27)
 		if [ "$char" = $'\e' ]; then
 			echo ""
@@ -4091,7 +4748,7 @@ read_with_esc() {
 			return 0
 		fi
 		
-		# Handle backspace
+		# Handle backspace/delete (ASCII 127 or backspace)
 		if [ "$char" = $'\x7f' ] || [ "$char" = $'\b' ]; then
 			if [ -n "$input" ]; then
 				input="${input%?}"
@@ -4099,8 +4756,9 @@ read_with_esc() {
 				echo -ne "\b \b"
 			fi
 		else
+			# Echo the character and add to input
+			echo -n "$char"
 			input+="$char"
-			# No extra echo here; terminal already echoed the char
 		fi
 	done
 	
@@ -4286,14 +4944,20 @@ goto_help_section() {
 }
 
 # Standard layout for all screens
+# Arguments:
+#   $1 - screen_name (optional): Title to display
+#   $2 - show_table (optional): "true" (default) or "false" to hide repository table
 show_standard_layout() {
     local screen_name="${1:-}"
+    local show_table="${2:-true}"
     clear
     echo -e "${YELLOW}GitBuilder v${VERSION}${NC}${screen_name:+ - ${CYAN}${screen_name}${NC}}"
     show_common_keys
     echo ""
-    show_repository_table
-    echo ""
+    if [ "$show_table" = "true" ]; then
+        show_repository_table
+        echo ""
+    fi
 }
 
 # Repository update check (real loading screen)
@@ -4768,7 +5432,7 @@ binary_backups_menu() {
     fi
     
     while true; do
-        show_standard_layout "Binary Backups - $repo_name"
+        show_standard_layout "Binary Backups - $repo_name" false
         
         local backup_count
         backup_count=$(count_binary_backups "$repo_id")
@@ -5089,26 +5753,104 @@ EOF
     read -rp "Press Enter to continue..."
 }
 
-# Delete a desktop launcher
-delete_desktop_launcher() {
+# Update desktop launcher if binary path has changed
+# Returns 0 if updated, 1 if no update needed, 2 if no launcher exists
+update_desktop_launcher_if_needed() {
+    local repo_id="$1"
+    
+    # Get current launcher info
+    local launcher_path
+    launcher_path=$(sqlite3 "$DB_FILE" "SELECT desktop_file_path FROM desktop_launchers WHERE repo_id = $repo_id;" 2>/dev/null)
+    
+    if [ -z "$launcher_path" ] || [ ! -f "$launcher_path" ]; then
+        return 2  # No launcher exists
+    fi
+    
+    # Get current binary path from repository
+    local current_binary
+    current_binary=$(sqlite3 "$DB_FILE" "SELECT binary_path FROM repositories WHERE id = $repo_id;" 2>/dev/null)
+    
+    if [ -z "$current_binary" ]; then
+        return 1  # No binary registered
+    fi
+    
+    # Get binary path from launcher file
+    local launcher_binary
+    launcher_binary=$(grep "^Exec=" "$launcher_path" 2>/dev/null | cut -d'=' -f2-)
+    
+    # Compare and update if different
+    if [ "$current_binary" != "$launcher_binary" ]; then
+        # Update the Exec line in the launcher
+        sed -i "s|^Exec=.*|Exec=$current_binary|" "$launcher_path"
+        echo -e "${CYAN}Desktop launcher updated with new binary path${NC}"
+        return 0
+    fi
+    
+    return 1  # No update needed
+}
+
+# Check if a repository has a desktop launcher
+# Returns 0 (true) if launcher exists, 1 (false) otherwise
+repo_has_desktop_launcher() {
+    local repo_id="$1"
+    local launcher_path
+    launcher_path=$(sqlite3 "$DB_FILE" "SELECT desktop_file_path FROM desktop_launchers WHERE repo_id = $repo_id;" 2>/dev/null)
+    
+    # Check both database record and file existence
+    if [ -n "$launcher_path" ] && [ -f "$launcher_path" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Delete a desktop launcher (non-interactive, for internal use)
+delete_desktop_launcher_silent() {
     local repo_id="$1"
     
     local launcher_info
     launcher_info=$(sqlite3 "$DB_FILE" "SELECT desktop_file_path FROM desktop_launchers WHERE repo_id = $repo_id;")
     
     if [ -z "$launcher_info" ]; then
-        echo -e "${YELLOW}No desktop launcher found for this repository${NC}"
         return 1
     fi
     
-    echo -e "${YELLOW}This will delete: $launcher_info${NC}"
-    read -rp "Are you sure? (y/N): " confirm
+    [ -f "$launcher_info" ] && rm -f "$launcher_info"
+    sqlite3 "$DB_FILE" "DELETE FROM desktop_launchers WHERE repo_id = $repo_id;"
+    return 0
+}
+
+# Delete a desktop launcher (interactive)
+delete_desktop_launcher() {
+    local repo_id="$1"
+    
+    local launcher_info repo_name
+    launcher_info=$(sqlite3 "$DB_FILE" "SELECT desktop_file_path FROM desktop_launchers WHERE repo_id = $repo_id;")
+    repo_name=$(sqlite3 "$DB_FILE" "SELECT name FROM repositories WHERE id = $repo_id;")
+    
+    if [ -z "$launcher_info" ]; then
+        echo -e "${YELLOW}No desktop launcher found for this repository${NC}"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+    
+    echo -e "\n${BLUE}Remove Desktop Launcher${NC}"
+    echo "============================================"
+    echo -e "Repository: ${CYAN}$repo_name${NC}"
+    echo -e "Launcher:   ${CYAN}$launcher_info${NC}"
+    echo ""
+    
+    read -rp "Remove this desktop launcher? (y/N): " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         [ -f "$launcher_info" ] && rm -f "$launcher_info"
         sqlite3 "$DB_FILE" "DELETE FROM desktop_launchers WHERE repo_id = $repo_id;"
-        echo -e "${GREEN}Desktop launcher deleted${NC}"
+        echo -e "${GREEN}Desktop launcher removed successfully!${NC}"
+        echo -e "${YELLOW}Note: You may need to log out and back in for the change to take effect.${NC}"
+    else
+        echo -e "${YELLOW}Removal cancelled${NC}"
     fi
+    
+    read -rp "Press Enter to continue..."
 }
 
 # =============================================================================
@@ -5214,7 +5956,7 @@ apply_profile_to_repo() {
 # Build profiles menu
 build_profiles_menu() {
     while true; do
-        show_standard_layout "Build Profiles"
+        show_standard_layout "Build Profiles" false
         echo "1) List profiles"
         echo "2) Create profile"
         echo "3) Delete profile"
@@ -5393,7 +6135,7 @@ clear_queue() {
 # Build queue menu
 build_queue_menu() {
     while true; do
-        show_standard_layout "Build Queue"
+        show_standard_layout "Build Queue" false
         show_build_queue
         echo ""
         echo "1) Add repository to queue"
@@ -5443,8 +6185,17 @@ record_build_history() {
     end_time=$(date +%s)
     local duration=$((end_time - start_time))
     
-    sqlite3 "$DB_FILE" "INSERT INTO build_history (repo_id, finished_at, success, duration_seconds, log_file, build_profile) 
-        VALUES ($repo_id, datetime('now'), $success, $duration, '$(sql_escape "$log_file")', '$(sql_escape "$profile")');"
+    # Get download metrics from exported variables
+    local download_seconds="${_BUILD_DOWNLOAD_SECONDS:-0}"
+    local download_size="${_BUILD_DOWNLOAD_SIZE:-0}"
+    local compile_seconds=$((duration - download_seconds))
+    [ "$compile_seconds" -lt 0 ] && compile_seconds=0
+    
+    sqlite3 "$DB_FILE" "INSERT INTO build_history (repo_id, finished_at, success, duration_seconds, download_seconds, compile_seconds, download_size_bytes, log_file, build_profile) 
+        VALUES ($repo_id, datetime('now'), $success, $duration, $download_seconds, $compile_seconds, $download_size, '$(sql_escape "$log_file")', '$(sql_escape "$profile")');"
+    
+    # Clear the exported variables
+    unset _BUILD_DOWNLOAD_SECONDS _BUILD_DOWNLOAD_SIZE
 }
 
 # Show build history
@@ -5675,7 +6426,7 @@ build_with_dependencies() {
 # Dependencies menu
 dependencies_menu() {
     while true; do
-        show_standard_layout "Dependencies"
+        show_standard_layout "Dependencies" false
         echo "1) Show dependencies for repository"
         echo "2) Add dependency"
         echo "3) Remove dependency"
@@ -5813,22 +6564,145 @@ send_notification() {
 check_for_updates() {
     echo -e "${BLUE}Checking for updates...${NC}"
     
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local base_url="https://raw.githubusercontent.com/vr51/GitBuilder/main"
+    
+    # Get remote version
     local remote_version
-    remote_version=$(curl -s "https://raw.githubusercontent.com/vr51/GitBuilder/main/gitbuilder" 2>/dev/null | grep "^# Version:" | head -1 | awk '{print $3}')
+    remote_version=$(curl -s "$base_url/gitbuilder" 2>/dev/null | grep "^VERSION=" | head -1 | cut -d'"' -f2)
     
     if [ -z "$remote_version" ]; then
         echo -e "${YELLOW}Could not check for updates${NC}"
         return 1
     fi
     
-    if [ "$remote_version" != "$VERSION" ]; then
-        echo -e "${GREEN}New version available: $remote_version (current: $VERSION)${NC}"
-        echo -e "Visit: $GITHUB_REPO"
-        return 0
-    else
+    if [ "$remote_version" = "$VERSION" ]; then
         echo -e "${GREEN}You are running the latest version ($VERSION)${NC}"
         return 0
     fi
+    
+    echo -e "${GREEN}New version available: $remote_version (current: $VERSION)${NC}"
+    echo ""
+    read -rp "Would you like to download and install the update? (y/N): " install_update
+    
+    if [[ ! "$install_update" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Update cancelled${NC}"
+        return 0
+    fi
+    
+    echo -e "${BLUE}Downloading update...${NC}"
+    
+    # Create temp directory for download
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    trap "rm -rf '$temp_dir'" EXIT
+    
+    # Download files
+    local download_failed=false
+    
+    # Download main script (required)
+    if curl -s "$base_url/gitbuilder" -o "$temp_dir/gitbuilder"; then
+        echo -e "  ${GREEN}✓${NC} gitbuilder"
+    else
+        echo -e "  ${RED}✗${NC} gitbuilder (download failed)"
+        download_failed=true
+    fi
+    
+    # Download HELP (required)
+    if curl -s "$base_url/HELP" -o "$temp_dir/HELP"; then
+        echo -e "  ${GREEN}✓${NC} HELP"
+    else
+        echo -e "  ${RED}✗${NC} HELP (download failed)"
+        download_failed=true
+    fi
+    
+    # Download README.md (optional, don't fail if missing)
+    if curl -s "$base_url/README.md" -o "$temp_dir/README.md" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} README.md"
+    else
+        echo -e "  ${YELLOW}○${NC} README.md (not available)"
+    fi
+    
+    # Download gitbuildfiles directory (optional, don't overwrite existing)
+    local gitbuildfiles_url="$base_url/gitbuildfiles"
+    # Try to get list of gitbuildfiles from GitHub API
+    local gitbuildfiles_list
+    gitbuildfiles_list=$(curl -s "https://api.github.com/repos/vr51/GitBuilder/contents/gitbuildfiles" 2>/dev/null | grep '"name"' | cut -d'"' -f4)
+    
+    if [ -n "$gitbuildfiles_list" ]; then
+        mkdir -p "$temp_dir/gitbuildfiles"
+        mkdir -p "$script_dir/gitbuildfiles"
+        echo -e "  ${BLUE}Checking gitbuildfiles...${NC}"
+        while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            # Only download if file doesn't exist locally
+            if [ ! -f "$script_dir/gitbuildfiles/$file" ]; then
+                if curl -s "$gitbuildfiles_url/$file" -o "$temp_dir/gitbuildfiles/$file" 2>/dev/null; then
+                    echo -e "    ${GREEN}✓${NC} $file (new)"
+                fi
+            else
+                echo -e "    ${YELLOW}○${NC} $file (keeping existing)"
+            fi
+        done <<< "$gitbuildfiles_list"
+    fi
+    
+    if [ "$download_failed" = true ]; then
+        echo -e "${RED}Download failed. Update cancelled.${NC}"
+        return 1
+    fi
+    
+    # Verify downloaded script has correct version
+    local downloaded_version
+    downloaded_version=$(grep "^VERSION=" "$temp_dir/gitbuilder" | head -1 | cut -d'"' -f2)
+    if [ "$downloaded_version" != "$remote_version" ]; then
+        echo -e "${RED}Downloaded file version mismatch. Update cancelled.${NC}"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${BLUE}Installing update...${NC}"
+    
+    # Backup current gitbuilder script (keep only one backup)
+    if [ -f "$script_dir/gitbuilder" ]; then
+        cp "$script_dir/gitbuilder" "$script_dir/gitbuilder.backup"
+        echo -e "  ${GREEN}✓${NC} Backed up current version to gitbuilder.backup"
+    fi
+    
+    # Install new files
+    cp "$temp_dir/gitbuilder" "$script_dir/gitbuilder"
+    chmod +x "$script_dir/gitbuilder"
+    echo -e "  ${GREEN}✓${NC} Installed gitbuilder"
+    
+    cp "$temp_dir/HELP" "$script_dir/HELP"
+    echo -e "  ${GREEN}✓${NC} Installed HELP"
+    
+    if [ -f "$temp_dir/README.md" ]; then
+        cp "$temp_dir/README.md" "$script_dir/README.md"
+        echo -e "  ${GREEN}✓${NC} Installed README.md"
+    fi
+    
+    # Install new gitbuildfiles (only new ones)
+    if [ -d "$temp_dir/gitbuildfiles" ]; then
+        for file in "$temp_dir/gitbuildfiles"/*; do
+            [ -f "$file" ] || continue
+            local filename
+            filename=$(basename "$file")
+            cp "$file" "$script_dir/gitbuildfiles/$filename"
+            echo -e "  ${GREEN}✓${NC} Installed gitbuildfiles/$filename"
+        done
+    fi
+    
+    echo ""
+    echo -e "${GREEN}Update complete! GitBuilder updated to version $remote_version${NC}"
+    echo -e "${YELLOW}Please restart GitBuilder to use the new version.${NC}"
+    
+    read -rp "Restart now? (Y/n): " restart_now
+    if [[ ! "$restart_now" =~ ^[Nn]$ ]]; then
+        exec "$script_dir/gitbuilder"
+    fi
+    
+    return 0
 }
 
 # =============================================================================
@@ -5837,7 +6711,7 @@ check_for_updates() {
 
 theme_menu() {
     while true; do
-        show_standard_layout "Theme Settings"
+        show_standard_layout "Theme Settings" false
         echo -e "Current theme: ${GREEN}$THEME${NC}"
         echo ""
         echo "1) Default"
@@ -5877,7 +6751,7 @@ theme_menu() {
 
 settings_menu() {
     while true; do
-        show_standard_layout "Settings"
+        show_standard_layout "Settings" false
         echo -e "${GRAY}Help: G + 6${NC}"
         echo "1) Theme: $THEME"
         echo "2) Notifications: ${NOTIFICATIONS_ENABLED:-true}"
