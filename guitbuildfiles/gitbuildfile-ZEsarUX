@@ -26,5 +26,40 @@ CMAKE_FLAGS=""
 # Path to the compiled binary (relative to repo root or absolute)
 BINARY_PATH="~/.local/share/gitbuilder/src/ZEsarUX/src/zesarux"
 
+# Desktop launcher settings
+LAUNCHER_ICON="~/.local/share/gitbuilder/src/ZEsarUX/src//zesarux.ico"
+LAUNCHER_CATEGORY="Game"
+
 # Repository notes (displayed after build)
-NOTES=""
+NOTES="# Amstrad Audio Issue
+
+When Amstrad CPC audio is accompanied by a constent humming note, opening ZEsarUX Settings > Audio and set the system to use only one AY chip.
+
+Some CPC users might need to set the audio driver from its default value to SDL.
+
+# Amstrad Games
+
+Games can be downloaded from https://amstradmuseum.emu-france.info/
+Direct link to the disk files: https://amstradmuseum.emu-france.info/Fichiers/DSK/
+
+Are you using Linux? Download all the software from Amstrad Museum by putting this line into a terminal:
+
+mkdir "~/CPC Games"; cd "~/CPC Games"; wget -r -np -nH --cut-dirs=1 -A "*" "https://amstradmuseum.emu-france.info/Fichiers/DSK/"
+
+Software will download into 'CPC Games' under your home directory. Move them to wherever you want to store them.
+
+# Spectrum Software
+
+ZEsarUX has a bult in software browser to find Spectrum software and download it to your home directory at (on Linux) ~/.zesarux/Games
+NB '~/' represents your home directory e.g $HOME
+
+Use the Software Browser by opening the ZEsarUX menu and clicking Network > ZX81 Browser or Network > Software Browser.
+
+# Software for other systems
+
+Try archive.org
+
+You will need to search the software archive for the games system you wish to use.
+
+The 'Non merged' MAME software should work in ZEsarUX too."
+

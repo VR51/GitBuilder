@@ -26,14 +26,40 @@ CMAKE_FLAGS="REGENIE=1 TOOLS=1 NOWERROR=1 ARCHOPTS=-U_FORTIFY_SOURCE"
 # Path to the compiled binary (relative to repo root or absolute)
 BINARY_PATH="~/.local/share/gitbuilder/src/MAME/mame"
 
+# Desktop launcher settings
+LAUNCHER_ICON="~/.local/share/gitbuilder/src/MAME/docs//source//images//MAMElogo.svg"
+LAUNCHER_CATEGORY="Game"
+
 # Repository notes (displayed after build)
-NOTES="Press INSERT to en/disable the MAME's system settings key while a system is running. Then use TAB to activate the system settings menu.
+NOTES="# Access the MAME menu from within a game/emulator
 
-MAME configuration files are usually stored in /home/<user name>/.mame/. Look for ___empty.ini or mame.ini and look for ui.ini.
-It is quicker to edit MAME software/game location URIs in the ini files than to do it in the MAME UI.
+Press INSERT to enable or disable the MAME's system settings key while a system is running. Then use TAB to activate the system settings menu.
 
-Put your category index files (e.g. catlist.ini, catver.ini, genre.ini, genre_ows.ini, mature.ini and not_mature.ini) in /home/<user name>/.mame/UI/.
-These can be download from https://www.progettosnaps.net/catver/. They are zipped files. Put the unzipped files in in /home/<user name>/.mame/UI/.
-Remember to check/update the correct mame.ini or ___empty.ini with the correct location of your category files; or press TAB in the MAME UI and set their loaction in general settings.
+- When disbled, the keyboard's keys all control the emulated system e.g F1 will do what F1 does on the emulated system.
+- When enabled, some keyboard keys will activate MAME's shortcuts e.g TAB opens the MAME menu, 5,6,7,8 insert coins, 1,2,3,4 start player 1-4 and F3 resets the game.
 
-After configuring the locations of your ini, software and dat files, remember to hit the magnifying glass icon in the MAME UI; this tells MAME to audit your media/files."
+MAME shortcuts: https://easyemu.mameworld.info/mameguide/getting_started/keyboard_shortcuts.html 
+
+# Config Files
+
+MAME configuration files are usually stored in /home/<user name>/.mame/. Look for ini files ___empty.ini or mame.ini and the file ui.ini.
+It is quicker to edit the MAME software location URIs by editing the ini files than to configure them in MAME's user inteface.
+
+# Category Lists
+
+These are catlist.ini, catver.ini, genre.ini, genre_ows.ini, mature.ini and not_mature.ini that go into in /home/<user name>/.mame/UI/.
+
+Download category lists from https://www.progettosnaps.net/catver/.
+
+Category lists are zipped. Put the unzipped files in /home/<user name>/.mame/UI/.
+
+Remember to check/update the correct mame.ini file (it may be called ___empty.ini) with the location of your category files or press TAB in the MAME UI and set their loaction in general settings.
+
+# General Tips
+
+After configuring the locations of your ini, software and dat files, hit the magnifying glass icon in the MAME UI to tell MAME to audit your media/files. You won't see your software or categories in the MAME UI unless you click the magnifying glass icon.
+
+# Software
+
+Have a look in archive.org or ask for help in reddit.com/r/mame"
+
