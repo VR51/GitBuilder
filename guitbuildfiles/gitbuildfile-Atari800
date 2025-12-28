@@ -26,12 +26,18 @@ CMAKE_FLAGS=""
 # Path to the compiled binary (relative to repo root or absolute)
 BINARY_PATH="~/.local/share/gitbuilder/src/Atari800/src/atari800"
 
-# Repository notes (displayed after build)
-NOTES="Keyboard, joystick and other controllers
-========================================
+# Desktop launcher settings
+LAUNCHER_ICON="~/.local/share/gitbuilder/src/Atari800/data//atari2.png"
+LAUNCHER_CATEGORY="Game"
 
-Unlike PC Xformer, I have not tried to emulate the exact keyboard layout,
-instead, I have tried to make your native keyboard work as normal.
+# Repository notes (displayed after build)
+NOTES="# Software
+
+Try http://www.mushca.com/f/atari/index.php?idx=1
+
+Look below the green (red if you're colourblind) page numbers. Click the blue disc icon and click the blue download arrow.
+
+# Keyboard, joystick and other controllers
 
 F1                   Built in user interface
 F2                   Option key
@@ -102,3 +108,4 @@ See the options above for how to enable mouse.
 
 (**) When Slow booting of DOS binary files is enabled, holding F7 during
 loading pauses the booting process."
+
